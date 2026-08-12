@@ -31,6 +31,7 @@
 //! [1] https://ieeexplore.ieee.org/document/11005588
 
 use std::{
+    f64::consts::{FRAC_PI_2, FRAC_PI_4, PI},
     io::{BufWriter, Write},
     path::PathBuf,
 };
@@ -73,8 +74,10 @@ fn main() {
     }
 
     // Fixed rotations determined by experimental setup.
-    let rot_bcam_bcar = Rotation3::<f64>::default();
-    let rot_c_bcam = Rotation3::<f64>::default();
+    // let rot_bcam_bcar = tait_bryan(-FRAC_PI_2, 0., 0.);
+    let rot_bcam_bcar = tait_bryan(0., 0., 0.);
+    let rot_c_bcam = tait_bryan(0., 0., PI);
+    // let rot_c_bcam = tait_bryan(0., 0., 0.);
     let rot_c_bcar = rot_c_bcam * rot_bcam_bcar;
 
     let n_pixels = N_PIXELS;
@@ -94,7 +97,11 @@ fn main() {
     for i in 0..N_FRAMES {
         // Given by the ins_frame; lets us determine n-frame to c-frame.
         // Azimuth is taken CW from North (likely need to negate it).
-        let rot_bcar_n = tait_bryan(-ins_frame[i].azimuth, ins_frame[i].pitch, ins_frame[i].roll);
+        let rot_bcar_n = tait_bryan(
+            FRAC_PI_2 - ins_frame[i].azimuth.to_radians(),
+            ins_frame[i].pitch.to_radians(),
+            ins_frame[i].roll.to_radians(),
+        );
         let rot_c_n = rot_c_bcar * rot_bcar_n;
 
         // Compute measured aop from image.
@@ -114,7 +121,7 @@ fn main() {
             time: time_frame[i],
             lat: ins_frame[i].lat,
             lon: ins_frame[i].lon,
-            aop,
+            aop_s: aop,
         };
 
         process_frame(&frame, &system);
@@ -149,7 +156,8 @@ struct Frame {
     time: DateTime<Utc>,
     lat: f64,
     lon: f64,
-    aop: Vec<f64>,
+    /// AoP in the sensor frame.
+    aop_s: Vec<f64>,
 }
 
 #[derive(Default)]
@@ -162,7 +170,8 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let s_n = psa(frame.lat, frame.lon, frame.time);
     let s_c = frame.rot_c_n * s_n;
 
-    let mut rayleigh_aop = vec![0f64; system.n_pixels];
+    let mut aop_v = vec![0f64; system.n_pixels];
+    let mut rayleigh_aop_v = vec![0f64; system.n_pixels];
     let mut rayleigh_point = vec![0u8; system.n_pixels];
 
     for i in 0..system.n_pixels {
@@ -171,11 +180,12 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
 
         let rot_v_c = compute_rot_v_c(v_c);
         let e_v = rot_v_c * e_c;
-        rayleigh_aop[i] = aop_from_ev(&e_v);
+
+        aop_v[i] = aop_sensor_to_v(frame.aop_s[i], system.all_p_c[i]);
+        rayleigh_aop_v[i] = aop_from_ev(&e_v);
 
         rayleigh_point[i] =
-            fan_method::aop_threshold(frame.aop[i], rayleigh_aop[i], system.aop_threshold_rad)
-                as u8;
+            fan_method::aop_threshold(aop_v[i], rayleigh_aop_v[i], system.aop_threshold_rad) as u8;
     }
 
     // Dump the raw rayleigh points for testing.
@@ -186,25 +196,54 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     .unwrap();
 
     // Dump the raw rayleigh aop for testing.
-    let filename = format!("rayleigh_aop_{:04}.bin", frame.index);
+    let filename = format!("rayleigh_aop_v_{:04}.bin", frame.index);
     let file = std::fs::File::create(filename).unwrap();
     let mut writer = BufWriter::new(file);
 
     // Convert each f64 into bytes and write
-    for &value in &rayleigh_aop {
+    for &value in &rayleigh_aop_v {
         writer.write_all(&value.to_be_bytes()).unwrap();
     }
 
-    let filename = format!("aop_{:04}.bin", frame.index);
+    let filename = format!("aop_s_{:04}.bin", frame.index);
     let file = std::fs::File::create(filename).unwrap();
     let mut writer = BufWriter::new(file);
 
     // Convert each f64 into bytes and write
-    for &value in &frame.aop {
+    for &value in &frame.aop_s {
+        writer.write_all(&value.to_be_bytes()).unwrap();
+    }
+
+    let filename = format!("aop_v_{:04}.bin", frame.index);
+    let file = std::fs::File::create(filename).unwrap();
+    let mut writer = BufWriter::new(file);
+
+    // Convert each f64 into bytes and write
+    for &value in &aop_v {
         writer.write_all(&value.to_be_bytes()).unwrap();
     }
 
     result
+}
+
+fn aop_sensor_to_v(aop_s: f64, p_c: Vector3<f64>) -> f64 {
+    // let offset = (-p_c.y).atan2(p_c.x);
+    let offset = p_c.y.atan2(p_c.x);
+    wrap_aop(aop_s - offset)
+}
+
+/// Ensure the aop falls on the interval (-pi/2, pi/2].
+fn wrap_aop(aop: f64) -> f64 {
+    let period = std::f64::consts::PI;
+    let half_period = std::f64::consts::FRAC_PI_2;
+
+    if !aop.is_finite() {
+        return aop;
+    }
+
+    // AoP is axial, so angles separated by pi represent the same polarization
+    // direction. This wraps onto (-pi/2, pi/2], mapping both endpoints to +pi/2.
+    half_period - (half_period - aop).rem_euclid(period)
 }
 
 /// Returns the rotation from the c-frame to the v-frame for an observation direction.
