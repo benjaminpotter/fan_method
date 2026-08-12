@@ -1,17 +1,39 @@
 //! Test the Fan method from [1]
 //!
-//! I want to iterate over the results from the dataset.
-//!
 //! Coordinate Systems:
+//! - a-frame: car body (XYZ)
 //! - b-frame: camera body (XYZ)
 //! - c-frame: camera optical (XYZ)
 //! - n-frame: horizontal reference (ENU)
 //! - v-frame: observation point coordinate system (XYZ)
 //!
+//! The v-frame is defined by the observation direction, v_c, in the c-frame.
+//! The z_v axis points along v_c.
+//! The y_v axis is located in the x_c y_c plane.
+//! The x_v axis is found by right-hand rule.
+//!
+//! I want to iterate over the results from the dataset.
+//! The dataset contains information from three sensors.
+//! All of the sensor data has been previously time-wise resampled.
+//! Each row (or image) corresponds to a single unique frame.
+//!
+//! 1. Reference system (Novatel Oem7 INSPVA)
+//!   - Lat, lon of car
+//!   - Orientation of a-frame in n-frame
+//!   - Stored in CSV file
+//! 2. GPS Time (Novatel Oem7 Time)
+//!   - Datetime
+//!   - Stored in CSV file
+//! 3. Polarization Camera (Lucid Vision PHX050S-P/Q)
+//!   - Measurements of the skylight polarization pattern
+//!   - Stored as png images named with the frame they correspond to
+//!
 //! [1] https://ieeexplore.ieee.org/document/11005588
 
+use std::io::{BufWriter, Write};
+
 use chrono::{DateTime, Utc};
-use nalgebra::{Rotation3, Vector3};
+use nalgebra::{Matrix3, Rotation3, Vector3};
 
 const ROWS: usize = 1024;
 const COLS: usize = 1224;
@@ -105,19 +127,21 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
 
     let s_n = psa(frame.lat, frame.lon, frame.time);
     let s_c = frame.rot_c_b * system.rot_b_n * s_n;
+
+    let mut rayleigh_aop = vec![0f64; system.n_pixels];
     let mut rayleigh_point = vec![0u8; system.n_pixels];
 
     for i in 0..system.n_pixels {
         let v_c = &system.all_v_c[i];
         let e_c = rayleigh_ev(v_c, &s_c);
 
-        // TODO: Define the rotation based on v_c.
-        let rot_v_c = Rotation3::default();
+        let rot_v_c = compute_rot_v_c(v_c);
         let e_v = rot_v_c * e_c;
-        let aop = aop_from_ev(&e_v);
+        rayleigh_aop[i] = aop_from_ev(&e_v);
 
         rayleigh_point[i] =
-            fan_method::aop_threshold(frame.aop[i], aop, system.aop_threshold_rad) as u8;
+            fan_method::aop_threshold(frame.aop[i], rayleigh_aop[i], system.aop_threshold_rad)
+                as u8;
     }
 
     // Dump the raw rayleigh points for testing.
@@ -127,7 +151,40 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     )
     .unwrap();
 
+    // Dump the raw rayleigh aop for testing.
+    let filename = format!("rayleigh_aop_{:04}.bin", frame.index);
+    let file = std::fs::File::create(filename).unwrap();
+    let mut writer = BufWriter::new(file);
+
+    // Convert each f64 into bytes and write
+    for &value in &rayleigh_aop {
+        writer.write_all(&value.to_be_bytes()).unwrap();
+    }
+
     result
+}
+
+/// Returns the rotation from the c-frame to the v-frame for an observation direction.
+fn compute_rot_v_c(v_c: &Vector3<f64>) -> Rotation3<f64> {
+    let z_v_c = v_c.normalize();
+
+    // The y_v axis lies in the x_c-y_c plane and is orthogonal to z_v.
+    let y_v_c = {
+        let candidate = Vector3::new(-z_v_c.y, z_v_c.x, 0.0);
+
+        if candidate.norm_squared() > f64::EPSILON {
+            candidate.normalize()
+        } else {
+            Vector3::y()
+        }
+    };
+
+    // Complete a right-handed frame: x_v × y_v = z_v.
+    let x_v_c = y_v_c.cross(&z_v_c).normalize();
+
+    Rotation3::from_matrix_unchecked(Matrix3::new(
+        x_v_c.x, x_v_c.y, x_v_c.z, y_v_c.x, y_v_c.y, y_v_c.z, z_v_c.x, z_v_c.y, z_v_c.z,
+    ))
 }
 
 /// Returns the direction vector to the sun from the observer based on the PSA algorithm.
