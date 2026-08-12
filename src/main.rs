@@ -74,10 +74,10 @@ fn main() {
     }
 
     // Fixed rotations determined by experimental setup.
-    // let rot_bcam_bcar = tait_bryan(-FRAC_PI_2, 0., 0.);
-    let rot_bcam_bcar = tait_bryan(0., 0., 0.);
-    let rot_c_bcam = tait_bryan(0., 0., PI);
-    // let rot_c_bcam = tait_bryan(0., 0., 0.);
+    let rot_bcam_bcar = tait_bryan(FRAC_PI_2, 0., 0.);
+    // let rot_bcam_bcar = tait_bryan(0., 0., 0.);
+    // let rot_c_bcam = tait_bryan(0., 0., PI);
+    let rot_c_bcam = tait_bryan(0., 0., 0.);
     let rot_c_bcar = rot_c_bcam * rot_bcam_bcar;
 
     let n_pixels = N_PIXELS;
@@ -97,11 +97,17 @@ fn main() {
     for i in 0..N_FRAMES {
         // Given by the ins_frame; lets us determine n-frame to c-frame.
         // Azimuth is taken CW from North (likely need to negate it).
-        let rot_bcar_n = tait_bryan(
-            FRAC_PI_2 - ins_frame[i].azimuth.to_radians(),
+        // NovAtel azimuth is clockwise from North.  In an ENU n-frame, a
+        // level car x-axis therefore points along (sin az, cos az, 0), which
+        // is produced by Rz(pi/2 - az).  That matrix maps bcar-frame
+        // components into n-frame components, so invert it before applying it
+        // to the sun vector s_n.
+        let rot_n_bcar = tait_bryan(
+            -ins_frame[i].azimuth.to_radians(),
             ins_frame[i].pitch.to_radians(),
             ins_frame[i].roll.to_radians(),
         );
+        let rot_bcar_n = rot_n_bcar.inverse();
         let rot_c_n = rot_c_bcar * rot_bcar_n;
 
         // Compute measured aop from image.
@@ -227,9 +233,13 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
 }
 
 fn aop_sensor_to_v(aop_s: f64, p_c: Vector3<f64>) -> f64 {
-    // let offset = (-p_c.y).atan2(p_c.x);
-    let offset = p_c.y.atan2(p_c.x);
-    wrap_aop(aop_s - offset)
+    // The v-frame x-axis projects onto the image plane in the radial direction
+    // from the optical center to this pixel.  If sensor AoP is measured CCW
+    // from +x_c, re-express it relative to +x_v by subtracting this radial
+    // bearing.  If the camera SDK defines +y upward or reports clockwise AoP,
+    // this is the one line to flip: use atan2(-p_c.y, p_c.x) and/or -aop_s.
+    let radial_bearing = p_c.y.atan2(p_c.x);
+    wrap_aop(aop_s - radial_bearing)
 }
 
 /// Ensure the aop falls on the interval (-pi/2, pi/2].
@@ -296,7 +306,7 @@ fn rayleigh_ev(v_c: &Vector3<f64>, s_c: &Vector3<f64>) -> Vector3<f64> {
 
 /// Returns the angle of polarization from the e-vector in the v-frame.
 fn aop_from_ev(e_v: &Vector3<f64>) -> f64 {
-    (e_v.y / e_v.x).atan()
+    wrap_aop(e_v.y.atan2(e_v.x))
 }
 
 /// Apply the Lagrange multiplier method to solve for the solar vector, s_c (3x1), given the optical paths, V_c (3xN),
