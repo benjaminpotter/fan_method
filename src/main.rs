@@ -1,8 +1,8 @@
 //! Test the Fan method from [1]
 //!
 //! Coordinate Systems:
-//! - a-frame: car body (XYZ)
-//! - b-frame: camera body (XYZ)
+//! - bcar-frame: car body (XYZ)
+//! - bcam-frame: camera body (XYZ)
 //! - c-frame: camera optical (XYZ)
 //! - n-frame: horizontal reference (ENU)
 //! - v-frame: observation point coordinate system (XYZ)
@@ -19,7 +19,7 @@
 //!
 //! 1. Reference system (Novatel Oem7 INSPVA)
 //!   - Lat, lon of car
-//!   - Orientation of a-frame in n-frame
+//!   - Orientation of bcar-frame in n-frame
 //!   - Stored in CSV file
 //! 2. GPS Time (Novatel Oem7 Time)
 //!   - Datetime
@@ -30,7 +30,10 @@
 //!
 //! [1] https://ieeexplore.ieee.org/document/11005588
 
-use std::io::{BufWriter, Write};
+use std::{
+    io::{BufWriter, Write},
+    path::PathBuf,
+};
 
 use chrono::{DateTime, Utc};
 use nalgebra::{Matrix3, Rotation3, Vector3};
@@ -43,6 +46,12 @@ const CENTER_COL: usize = COLS / 2;
 const PIXEL_SIZE_MM: f64 = 0.0069;
 const FOCAL_LENGTH_MM: f64 = 8.0;
 const AOP_THRESHOLD_DEG: f64 = 5.0;
+const TIME_CSV: &'static str =
+    "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/novatel_oem7_time/novatel_oem7_time.csv";
+const INS_CSV: &'static str = "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/novatel_oem7_inspva/novatel_oem7_inspva.csv";
+const IMAGE_DIR: &'static str =
+    "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/camera_driver_gv_vis_image_raw";
+const N_FRAMES: usize = 1;
 
 fn main() {
     println!("Fan Method v0.1");
@@ -63,41 +72,66 @@ fn main() {
         }
     }
 
-    let rot_b_n = Rotation3::<f64>::default();
+    // Fixed rotations determined by experimental setup.
+    let rot_bcam_bcar = Rotation3::<f64>::default();
+    let rot_c_bcam = Rotation3::<f64>::default();
+    let rot_c_bcar = rot_c_bcam * rot_bcam_bcar;
+
     let n_pixels = N_PIXELS;
     let aop_threshold_rad = AOP_THRESHOLD_DEG.to_radians();
 
     let system = System {
-        rot_b_n,
         all_p_c,
         all_v_c,
         aop_threshold_rad,
         n_pixels,
     };
 
-    let index = 0;
-    let rot_c_b = Rotation3::<f64>::default();
-    let time = Utc::now();
-    let lat = -45.;
-    let lon = 45.;
-    let aop = vec![0.; N_PIXELS];
+    let time_frame = fan_method::dataset::read_time(TIME_CSV).unwrap();
+    let ins_frame = fan_method::dataset::read_ins(INS_CSV).unwrap();
+    let image_dir = PathBuf::new().join(IMAGE_DIR);
 
-    let frame = Frame {
-        index,
-        rot_c_b,
-        time,
-        lat,
-        lon,
-        aop,
-    };
+    for i in 0..N_FRAMES {
+        // Given by the ins_frame; lets us determine n-frame to c-frame.
+        // Azimuth is taken CW from North (likely need to negate it).
+        let rot_bcar_n = tait_bryan(-ins_frame[i].azimuth, ins_frame[i].pitch, ins_frame[i].roll);
+        let rot_c_n = rot_c_bcar * rot_bcar_n;
 
-    process_frame(&frame, &system);
+        // Compute measured aop from image.
+        let image_file = format!("camera_driver_gv_vis_image_raw_{:04}.png", i);
+        let image_file = image_dir.join(image_file);
+        let aop = match fan_method::dataset::read_image(image_file) {
+            Ok(aop) => aop,
+            Err(e) => {
+                eprintln!("failed to read image: {e}");
+                continue;
+            }
+        };
+
+        let frame = Frame {
+            index: i,
+            rot_c_n,
+            time: time_frame[i],
+            lat: ins_frame[i].lat,
+            lon: ins_frame[i].lon,
+            aop,
+        };
+
+        process_frame(&frame, &system);
+    }
+}
+
+/// Builds a rotation matrix from ZYX angles.
+fn tait_bryan(yaw: f64, pitch: f64, roll: f64) -> Rotation3<f64> {
+    let rot_z = Rotation3::from_axis_angle(&Vector3::z_axis(), yaw);
+    let rot_y = Rotation3::from_axis_angle(&Vector3::y_axis(), pitch);
+    let rot_x = Rotation3::from_axis_angle(&Vector3::x_axis(), roll);
+
+    rot_z * rot_y * rot_x
 }
 
 /// Stores information which remains static across frames.
 struct System {
-    /// Rotation between the n-frame and the b-frame.
-    rot_b_n: Rotation3<f64>,
     /// Pixel positions in the c-frame.
     all_p_c: Vec<Vector3<f64>>,
     /// Optical paths in the c-frame.
@@ -111,7 +145,7 @@ struct System {
 /// Stores information unique to each frame.
 struct Frame {
     index: usize,
-    rot_c_b: Rotation3<f64>,
+    rot_c_n: Rotation3<f64>,
     time: DateTime<Utc>,
     lat: f64,
     lon: f64,
@@ -126,7 +160,7 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let mut result = FrameResult::default();
 
     let s_n = psa(frame.lat, frame.lon, frame.time);
-    let s_c = frame.rot_c_b * system.rot_b_n * s_n;
+    let s_c = frame.rot_c_n * s_n;
 
     let mut rayleigh_aop = vec![0f64; system.n_pixels];
     let mut rayleigh_point = vec![0u8; system.n_pixels];
@@ -158,6 +192,15 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
 
     // Convert each f64 into bytes and write
     for &value in &rayleigh_aop {
+        writer.write_all(&value.to_be_bytes()).unwrap();
+    }
+
+    let filename = format!("aop_{:04}.bin", frame.index);
+    let file = std::fs::File::create(filename).unwrap();
+    let mut writer = BufWriter::new(file);
+
+    // Convert each f64 into bytes and write
+    for &value in &frame.aop {
         writer.write_all(&value.to_be_bytes()).unwrap();
     }
 

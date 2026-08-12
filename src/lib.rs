@@ -1,3 +1,5 @@
+pub mod dataset;
+
 /// Check whether the candidate is within threshold of target.
 ///
 /// Ensure wrapping is handled.
