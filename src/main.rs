@@ -59,10 +59,19 @@ fn main() {
     println!("Implemented by Ben Potter in August 2026");
     println!("See original paper: https://ieeexplore.ieee.org/document/11005588");
 
-    // Compute the optical paths once at startup.
+    // Fixed rotations determined by experimental setup.
+    let rot_bcam_bcar = tait_bryan(FRAC_PI_2, 0., 0.);
+    let rot_c_bcam = tait_bryan(0., 0., 0.);
+    let rot_c_bcar = rot_c_bcam * rot_bcam_bcar;
+
+    let n_pixels = N_PIXELS;
+    let aop_threshold_rad = AOP_THRESHOLD_DEG.to_radians();
+    let image_dir = PathBuf::new().join(IMAGE_DIR);
+
     let mut all_p_c = Vec::new();
     let mut all_v_c = Vec::new();
 
+    // Compute the optical paths once at startup.
     for row in 0..ROWS {
         for col in 0..COLS {
             let p_c = pixel(row, col, CENTER_ROW, CENTER_COL, PIXEL_SIZE_MM);
@@ -73,16 +82,6 @@ fn main() {
         }
     }
 
-    // Fixed rotations determined by experimental setup.
-    let rot_bcam_bcar = tait_bryan(FRAC_PI_2, 0., 0.);
-    // let rot_bcam_bcar = tait_bryan(0., 0., 0.);
-    // let rot_c_bcam = tait_bryan(0., 0., PI);
-    let rot_c_bcam = tait_bryan(0., 0., 0.);
-    let rot_c_bcar = rot_c_bcam * rot_bcam_bcar;
-
-    let n_pixels = N_PIXELS;
-    let aop_threshold_rad = AOP_THRESHOLD_DEG.to_radians();
-
     let system = System {
         all_p_c,
         all_v_c,
@@ -92,8 +91,6 @@ fn main() {
 
     let time_frame = fan_method::dataset::read_time(TIME_CSV).unwrap();
     let ins_frame = fan_method::dataset::read_ins(INS_CSV).unwrap();
-    let image_dir = PathBuf::new().join(IMAGE_DIR);
-
     for i in 0..N_FRAMES {
         // Given by the ins_frame; lets us determine n-frame to c-frame.
         // Azimuth is taken CW from North (likely need to negate it).
@@ -132,15 +129,6 @@ fn main() {
 
         process_frame(&frame, &system);
     }
-}
-
-/// Builds a rotation matrix from ZYX angles.
-fn tait_bryan(yaw: f64, pitch: f64, roll: f64) -> Rotation3<f64> {
-    let rot_z = Rotation3::from_axis_angle(&Vector3::z_axis(), yaw);
-    let rot_y = Rotation3::from_axis_angle(&Vector3::y_axis(), pitch);
-    let rot_x = Rotation3::from_axis_angle(&Vector3::x_axis(), roll);
-
-    rot_z * rot_y * rot_x
 }
 
 /// Stores information which remains static across frames.
@@ -194,42 +182,16 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
             fan_method::aop_threshold(aop_v[i], rayleigh_aop_v[i], system.aop_threshold_rad) as u8;
     }
 
-    // Dump the raw rayleigh points for testing.
-    std::fs::write(
-        format!("rayleigh_point_{:04}.bin", frame.index),
-        rayleigh_point,
-    )
-    .unwrap();
-
-    // Dump the raw rayleigh aop for testing.
-    let filename = format!("rayleigh_aop_v_{:04}.bin", frame.index);
-    let file = std::fs::File::create(filename).unwrap();
-    let mut writer = BufWriter::new(file);
-
-    // Convert each f64 into bytes and write
-    for &value in &rayleigh_aop_v {
-        writer.write_all(&value.to_be_bytes()).unwrap();
-    }
-
-    let filename = format!("aop_s_{:04}.bin", frame.index);
-    let file = std::fs::File::create(filename).unwrap();
-    let mut writer = BufWriter::new(file);
-
-    // Convert each f64 into bytes and write
-    for &value in &frame.aop_s {
-        writer.write_all(&value.to_be_bytes()).unwrap();
-    }
-
-    let filename = format!("aop_v_{:04}.bin", frame.index);
-    let file = std::fs::File::create(filename).unwrap();
-    let mut writer = BufWriter::new(file);
-
-    // Convert each f64 into bytes and write
-    for &value in &aop_v {
-        writer.write_all(&value.to_be_bytes()).unwrap();
-    }
-
     result
+}
+
+/// Builds a rotation matrix from ZYX angles.
+fn tait_bryan(yaw: f64, pitch: f64, roll: f64) -> Rotation3<f64> {
+    let rot_z = Rotation3::from_axis_angle(&Vector3::z_axis(), yaw);
+    let rot_y = Rotation3::from_axis_angle(&Vector3::y_axis(), pitch);
+    let rot_x = Rotation3::from_axis_angle(&Vector3::x_axis(), roll);
+
+    rot_z * rot_y * rot_x
 }
 
 fn aop_sensor_to_v(aop_s: f64, p_c: Vector3<f64>) -> f64 {
