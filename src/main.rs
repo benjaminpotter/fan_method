@@ -248,7 +248,11 @@ fn psa(lat: f64, lon: f64, time: DateTime<Utc>) -> Vector3<f64> {
 
     // spa uses degrees so we have to convert to radians.
     let zenith_angle = sp.zenith_angle.to_radians();
-    let azimuth = sp.azimuth.to_radians();
+    // spa takes azimuth CW from north
+    // we want it as an angle in the ENU system
+    // take it CCW from east
+    let azimuth = FRAC_PI_2 - sp.azimuth.to_radians();
+    // let azimuth = sp.azimuth.to_radians();
 
     Vector3::new(
         zenith_angle.sin() * azimuth.sin(),
