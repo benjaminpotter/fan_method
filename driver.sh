@@ -15,7 +15,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
-#SBATCH --array=0-15
+#SBATCH --array=0-15%4
 #SBATCH --output=fan-method_%A_%a.out
 #SBATCH --error=fan-method_%A_%a.err
 
