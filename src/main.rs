@@ -91,7 +91,10 @@ fn main() {
 
     let time_frame = fan_method::dataset::read_time(TIME_CSV).unwrap();
     let ins_frame = fan_method::dataset::read_ins(INS_CSV).unwrap();
-    for i in 0..N_FRAMES {
+    // for i in 0..N_FRAMES {
+    for i in (0..1000).step_by(100) {
+        println!("start frame {i}");
+
         // Given by the ins_frame; lets us determine n-frame to c-frame.
         // Azimuth is taken CW from North (likely need to negate it).
         // NovAtel azimuth is clockwise from North.  In an ENU n-frame, a
@@ -160,8 +163,8 @@ struct FrameResult {}
 fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let result = FrameResult::default();
 
-    let s_n = psa(frame.lat, frame.lon, frame.time);
-    let s_c = frame.rot_c_n * s_n;
+    let psa_s_n = psa(frame.lat, frame.lon, frame.time);
+    let psa_s_c = frame.rot_c_n * psa_s_n;
 
     let mut aop_v = vec![0f64; system.n_pixels];
     let mut rayleigh_aop_v = vec![0f64; system.n_pixels];
@@ -170,7 +173,7 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
 
     for i in 0..system.n_pixels {
         let v_c = &system.all_v_c[i];
-        let rayleigh_e_c = rayleigh_ev(v_c, &s_c);
+        let rayleigh_e_c = rayleigh_ev(v_c, &psa_s_c);
 
         let rot_v_c = compute_rot_v_c(v_c);
         let rayleigh_e_v = rot_v_c * rayleigh_e_c;
@@ -189,23 +192,23 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
         }
     }
 
-    let a = Matrix3xX::from_columns(&e_c);
-    let m = &a * a.transpose();
-    let eig = m.symmetric_eigen();
-    let (min_idx, _) = eig
-        .eigenvalues
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("NaN encountered in eigenvalues"))
-        .expect("eigenvalues vector was empty");
+    let s_c = compute_s_c(&e_c);
 
-    let optimal_s_c = eig.eigenvectors.column(min_idx).into_owned().normalize();
+    let psa_az = compute_azimuth(&psa_s_c);
+    let az = compute_azimuth(&s_c);
+
+    let abs_diff = (psa_az - az).abs().to_degrees();
+    println!("{abs_diff} degrees");
+
+    return result;
+
+    // For testing:
 
     let filename = format!("optimal_s_c_{:04}.bin", frame.index);
     let file = std::fs::File::create(filename).unwrap();
     let mut writer = BufWriter::new(file);
 
-    for &value in optimal_s_c.iter() {
+    for &value in s_c.iter() {
         writer.write_all(&value.to_be_bytes()).unwrap();
     }
 
@@ -244,6 +247,26 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     }
 
     result
+}
+
+/// Computes the azimuth angle of a vector CCW from +X.
+fn compute_azimuth(v: &Vector3<f64>) -> f64 {
+    v.y.atan2(v.x)
+}
+
+/// Compute the optimal solar vector from e-vector measurements via eigendecomposition.
+fn compute_s_c(e_c: &[Vector3<f64>]) -> Vector3<f64> {
+    let a = Matrix3xX::from_columns(&e_c);
+    let m = &a * a.transpose();
+    let eig = m.symmetric_eigen();
+    let (min_idx, _) = eig
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("NaN encountered in eigenvalues"))
+        .expect("eigenvalues vector was empty");
+
+    eig.eigenvectors.column(min_idx).into_owned().normalize()
 }
 
 /// Builds a rotation matrix from ZYX angles.
@@ -310,14 +333,9 @@ fn psa(lat: f64, lon: f64, time: DateTime<Utc>) -> Vector3<f64> {
     // spa uses degrees. Its azimuth is clockwise from north. In this code's
     // ENU n-frame (x=east, y=north, z=up), the horizontal components are
     // east = sin(zenith) * sin(azimuth), north = sin(zenith) * cos(azimuth).
-    enu_from_zenith_azimuth_cw_north(sp.zenith_angle.to_radians(), sp.azimuth.to_radians())
-}
-
-fn enu_from_zenith_azimuth_cw_north(zenith_angle: f64, azimuth_cw_from_north: f64) -> Vector3<f64> {
-    Vector3::new(
-        zenith_angle.sin() * azimuth_cw_from_north.sin(),
-        zenith_angle.sin() * azimuth_cw_from_north.cos(),
-        zenith_angle.cos(),
+    fan_method::enu_from_zenith_azimuth_cw_north(
+        sp.zenith_angle.to_radians(),
+        sp.azimuth.to_radians(),
     )
 }
 
@@ -372,27 +390,4 @@ fn optical_path(pixel: Vector3<f64>, focal_length: f64) -> Vector3<f64> {
     // There may be some additional work to correct any mistaken reference frames.
 
     Vector3::new(pixel.x, pixel.y, focal_length)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn enu_solar_azimuth_cardinal_directions_are_correct() {
-        let zenith = FRAC_PI_2;
-        let eps = 1e-12;
-
-        let north = enu_from_zenith_azimuth_cw_north(zenith, 0.0);
-        assert!(north.x.abs() < eps);
-        assert!((north.y - 1.0).abs() < eps);
-
-        let east = enu_from_zenith_azimuth_cw_north(zenith, FRAC_PI_2);
-        assert!((east.x - 1.0).abs() < eps);
-        assert!(east.y.abs() < eps);
-
-        let south = enu_from_zenith_azimuth_cw_north(zenith, PI);
-        assert!(south.x.abs() < eps);
-        assert!((south.y + 1.0).abs() < eps);
-    }
 }
