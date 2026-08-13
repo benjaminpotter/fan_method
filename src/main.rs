@@ -39,7 +39,8 @@
 //! - [x] Get timing information for the algorithm
 //! - [x] Also compute the s_c using all e-vectors (ignoring rayleigh points)
 //! - [x] Move helper functions to src/lib.rs; add documentation comment and tests to each.
-//! - [ ] Dump the frame result structure as a CSV file
+//! - [x] Dump the frame result structure as a CSV file
+//!   - Ensure the file has a descriptive name
 //!   - Unpack the vectors into NAME.x, NAME.y, NAME.z fields
 //! - [ ] Add comments throughout that explain the implementation of the algorithm
 //! - [ ] Ensure no crashes during long running HPC job
@@ -54,8 +55,9 @@
 //! [2] https://slurm.schedmd.com/overview.html
 
 use std::{
+    error::Error,
     f64::consts::{FRAC_PI_2, PI},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Instant,
 };
 
@@ -79,9 +81,10 @@ const TIME_CSV: &'static str =
 const INS_CSV: &'static str = "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/novatel_oem7_inspva/novatel_oem7_inspva.csv";
 const IMAGE_DIR: &'static str =
     "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/camera_driver_gv_vis_image_raw";
+const OUTPUT_CSV: &'static str = "frame_results.csv";
 const N_FRAMES: usize = 1;
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     println!("Fan Method v0.1");
     println!("Implemented by Ben Potter in August 2026");
     println!("See original paper: https://ieeexplore.ieee.org/document/11005588");
@@ -124,6 +127,7 @@ fn main() {
 
     let time_frame = fan_method::dataset::read_time(TIME_CSV).unwrap();
     let ins_frame = fan_method::dataset::read_ins(INS_CSV).unwrap();
+    let mut results = Vec::new();
     for i in 0..N_FRAMES {
         // TODO: improve logging
         // println!("start frame {i}");
@@ -171,7 +175,13 @@ fn main() {
             result.pixel_loop_duration_ms,
             result.eigendecomp_duration_ms,
         );
+        results.push(result);
     }
+
+    write_frame_results(OUTPUT_CSV, &results)?;
+    println!("wrote {} frame results to {OUTPUT_CSV}", results.len());
+
+    Ok(())
 }
 
 /// Stores information which remains static across frames.
@@ -318,4 +328,67 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
         pixel_loop_duration_ms,
         eigendecomp_duration_ms,
     }
+}
+
+/// Write frame results to a CSV file, unpacking vector fields into x/y/z columns.
+fn write_frame_results(
+    path: impl AsRef<Path>,
+    results: &[FrameResult],
+) -> Result<(), Box<dyn Error>> {
+    let mut writer = csv::Writer::from_path(path)?;
+
+    writer.write_record([
+        "index",
+        "time",
+        "lat",
+        "lon",
+        "psa_s_c.x",
+        "psa_s_c.y",
+        "psa_s_c.z",
+        "s_c.x",
+        "s_c.y",
+        "s_c.z",
+        "rayleigh_s_c.x",
+        "rayleigh_s_c.y",
+        "rayleigh_s_c.z",
+        "psa_azimuth",
+        "azimuth",
+        "rayleigh_azimuth",
+        "n_rayleigh_points",
+        "frac_rayleigh_points",
+        "total_duration_ms",
+        "psa_duration_ms",
+        "pixel_loop_duration_ms",
+        "eigendecomp_duration_ms",
+    ])?;
+
+    for result in results {
+        writer.write_record([
+            result.index.to_string(),
+            result.time.to_rfc3339(),
+            result.lat.to_string(),
+            result.lon.to_string(),
+            result.psa_s_c.x.to_string(),
+            result.psa_s_c.y.to_string(),
+            result.psa_s_c.z.to_string(),
+            result.s_c.x.to_string(),
+            result.s_c.y.to_string(),
+            result.s_c.z.to_string(),
+            result.rayleigh_s_c.x.to_string(),
+            result.rayleigh_s_c.y.to_string(),
+            result.rayleigh_s_c.z.to_string(),
+            result.psa_azimuth.to_string(),
+            result.azimuth.to_string(),
+            result.rayleigh_azimuth.to_string(),
+            result.n_rayleigh_points.to_string(),
+            result.frac_rayleigh_points.to_string(),
+            result.total_duration_ms.to_string(),
+            result.psa_duration_ms.to_string(),
+            result.pixel_loop_duration_ms.to_string(),
+            result.eigendecomp_duration_ms.to_string(),
+        ])?;
+    }
+
+    writer.flush()?;
+    Ok(())
 }
