@@ -31,7 +31,7 @@
 //! [1] https://ieeexplore.ieee.org/document/11005588
 
 use std::{
-    f64::consts::{FRAC_PI_2, FRAC_PI_4, PI},
+    f64::consts::{FRAC_PI_2, PI},
     io::{BufWriter, Write},
     path::PathBuf,
 };
@@ -60,7 +60,7 @@ fn main() {
     println!("See original paper: https://ieeexplore.ieee.org/document/11005588");
 
     // Fixed rotations determined by experimental setup.
-    let rot_bcam_bcar = tait_bryan(FRAC_PI_2, 0., 0.);
+    let rot_bcam_bcar = tait_bryan(PI, 0., 0.);
     let rot_c_bcam = tait_bryan(0., 0., 0.);
     let rot_c_bcar = rot_c_bcam * rot_bcam_bcar;
 
@@ -100,12 +100,11 @@ fn main() {
         // components into n-frame components, so invert it before applying it
         // to the sun vector s_n.
         let rot_n_bcar = tait_bryan(
-            -ins_frame[i].azimuth.to_radians(),
+            FRAC_PI_2 - ins_frame[i].azimuth.to_radians(),
             ins_frame[i].pitch.to_radians(),
             ins_frame[i].roll.to_radians(),
         );
-        let rot_bcar_n = rot_n_bcar.inverse();
-        let rot_c_n = rot_c_bcar * rot_bcar_n;
+        let rot_c_n = rot_c_bcar * rot_n_bcar.inverse();
 
         // Compute measured aop from image.
         let image_file = format!("camera_driver_gv_vis_image_raw_{:04}.png", i);
@@ -159,7 +158,7 @@ struct FrameResult {}
 
 /// The meat and potatoes of the algorithm.
 fn process_frame(frame: &Frame, system: &System) -> FrameResult {
-    let mut result = FrameResult::default();
+    let result = FrameResult::default();
 
     let s_n = psa(frame.lat, frame.lon, frame.time);
     let s_c = frame.rot_c_n * s_n;
@@ -167,19 +166,59 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let mut aop_v = vec![0f64; system.n_pixels];
     let mut rayleigh_aop_v = vec![0f64; system.n_pixels];
     let mut rayleigh_point = vec![0u8; system.n_pixels];
+    let mut e_v = Vec::new();
 
     for i in 0..system.n_pixels {
         let v_c = &system.all_v_c[i];
         let e_c = rayleigh_ev(v_c, &s_c);
 
         let rot_v_c = compute_rot_v_c(v_c);
-        let e_v = rot_v_c * e_c;
+        let rayleigh_e_v = rot_v_c * e_c;
 
         aop_v[i] = aop_sensor_to_v(frame.aop_s[i], system.all_p_c[i]);
-        rayleigh_aop_v[i] = aop_from_ev(&e_v);
+        rayleigh_aop_v[i] = aop_from_ev(&rayleigh_e_v);
 
-        rayleigh_point[i] =
-            fan_method::aop_threshold(aop_v[i], rayleigh_aop_v[i], system.aop_threshold_rad) as u8;
+        let is_rayleigh_point =
+            fan_method::aop_threshold(aop_v[i], rayleigh_aop_v[i], system.aop_threshold_rad);
+        rayleigh_point[i] = is_rayleigh_point as u8;
+
+        if is_rayleigh_point {
+            e_v.push(ev_from_aop(aop_v[i]));
+        }
+    }
+
+    // Dump the raw rayleigh-point mask and AoP values for testing.
+    let filename = format!("rayleigh_point_{:04}.bin", frame.index);
+    let file = std::fs::File::create(filename).unwrap();
+    let mut writer = BufWriter::new(file);
+
+    writer.write_all(&rayleigh_point).unwrap();
+
+    let filename = format!("rayleigh_aop_v_{:04}.bin", frame.index);
+    let file = std::fs::File::create(filename).unwrap();
+    let mut writer = BufWriter::new(file);
+
+    // Convert each f64 into bytes and write
+    for &value in &rayleigh_aop_v {
+        writer.write_all(&value.to_be_bytes()).unwrap();
+    }
+
+    let filename = format!("aop_s_{:04}.bin", frame.index);
+    let file = std::fs::File::create(filename).unwrap();
+    let mut writer = BufWriter::new(file);
+
+    // Convert each f64 into bytes and write
+    for &value in &frame.aop_s {
+        writer.write_all(&value.to_be_bytes()).unwrap();
+    }
+
+    let filename = format!("aop_v_{:04}.bin", frame.index);
+    let file = std::fs::File::create(filename).unwrap();
+    let mut writer = BufWriter::new(file);
+
+    // Convert each f64 into bytes and write
+    for &value in &aop_v {
+        writer.write_all(&value.to_be_bytes()).unwrap();
     }
 
     result
@@ -246,17 +285,16 @@ fn psa(lat: f64, lon: f64, time: DateTime<Utc>) -> Vector3<f64> {
     let sp = spa::solar_position::<spa::StdFloatOps>(time, lat, lon)
         .expect("valid lat, lon, time in PSA algorithm");
 
-    // spa uses degrees so we have to convert to radians.
-    let zenith_angle = sp.zenith_angle.to_radians();
-    // spa takes azimuth CW from north
-    // we want it as an angle in the ENU system
-    // take it CCW from east
-    let azimuth = FRAC_PI_2 - sp.azimuth.to_radians();
-    // let azimuth = sp.azimuth.to_radians();
+    // spa uses degrees. Its azimuth is clockwise from north. In this code's
+    // ENU n-frame (x=east, y=north, z=up), the horizontal components are
+    // east = sin(zenith) * sin(azimuth), north = sin(zenith) * cos(azimuth).
+    enu_from_zenith_azimuth_cw_north(sp.zenith_angle.to_radians(), sp.azimuth.to_radians())
+}
 
+fn enu_from_zenith_azimuth_cw_north(zenith_angle: f64, azimuth_cw_from_north: f64) -> Vector3<f64> {
     Vector3::new(
-        zenith_angle.sin() * azimuth.sin(),
-        zenith_angle.sin() * azimuth.cos(),
+        zenith_angle.sin() * azimuth_cw_from_north.sin(),
+        zenith_angle.sin() * azimuth_cw_from_north.cos(),
         zenith_angle.cos(),
     )
 }
@@ -273,6 +311,11 @@ fn rayleigh_ev(v_c: &Vector3<f64>, s_c: &Vector3<f64>) -> Vector3<f64> {
 /// Returns the angle of polarization from the e-vector in the v-frame.
 fn aop_from_ev(e_v: &Vector3<f64>) -> f64 {
     wrap_aop(e_v.y.atan2(e_v.x))
+}
+
+/// Returns the e-vector from the angle of polarization in the v-frame.
+fn ev_from_aop(aop_v: f64) -> Vector3<f64> {
+    Vector3::new(aop_v.cos(), aop_v.sin(), 0.)
 }
 
 /// Apply the Lagrange multiplier method to solve for the solar vector, s_c (3x1), given the optical paths, V_c (3xN),
@@ -307,4 +350,27 @@ fn optical_path(pixel: Vector3<f64>, focal_length: f64) -> Vector3<f64> {
     // There may be some additional work to correct any mistaken reference frames.
 
     Vector3::new(pixel.x, pixel.y, focal_length)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enu_solar_azimuth_cardinal_directions_are_correct() {
+        let zenith = FRAC_PI_2;
+        let eps = 1e-12;
+
+        let north = enu_from_zenith_azimuth_cw_north(zenith, 0.0);
+        assert!(north.x.abs() < eps);
+        assert!((north.y - 1.0).abs() < eps);
+
+        let east = enu_from_zenith_azimuth_cw_north(zenith, FRAC_PI_2);
+        assert!((east.x - 1.0).abs() < eps);
+        assert!(east.y.abs() < eps);
+
+        let south = enu_from_zenith_azimuth_cw_north(zenith, PI);
+        assert!(south.x.abs() < eps);
+        assert!((south.y + 1.0).abs() < eps);
+    }
 }
