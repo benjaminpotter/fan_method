@@ -37,7 +37,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use nalgebra::{Matrix3, Rotation3, Vector3};
+use nalgebra::{DMatrix, Matrix, Matrix3, Matrix3xX, Rotation3, Vector3};
 
 const ROWS: usize = 1024;
 const COLS: usize = 1224;
@@ -166,14 +166,14 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let mut aop_v = vec![0f64; system.n_pixels];
     let mut rayleigh_aop_v = vec![0f64; system.n_pixels];
     let mut rayleigh_point = vec![0u8; system.n_pixels];
-    let mut e_v = Vec::new();
+    let mut e_c = Vec::new();
 
     for i in 0..system.n_pixels {
         let v_c = &system.all_v_c[i];
-        let e_c = rayleigh_ev(v_c, &s_c);
+        let rayleigh_e_c = rayleigh_ev(v_c, &s_c);
 
         let rot_v_c = compute_rot_v_c(v_c);
-        let rayleigh_e_v = rot_v_c * e_c;
+        let rayleigh_e_v = rot_v_c * rayleigh_e_c;
 
         aop_v[i] = aop_sensor_to_v(frame.aop_s[i], system.all_p_c[i]);
         rayleigh_aop_v[i] = aop_from_ev(&rayleigh_e_v);
@@ -183,9 +183,25 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
         rayleigh_point[i] = is_rayleigh_point as u8;
 
         if is_rayleigh_point {
-            e_v.push(ev_from_aop(aop_v[i]));
+            let rot_c_v = rot_v_c.inverse();
+            let e_v = ev_from_aop(aop_v[i]);
+            e_c.push(rot_c_v * e_v);
         }
     }
+
+    let a = Matrix3xX::from_columns(&e_c);
+    let m = &a * a.transpose();
+    let eig = m.symmetric_eigen();
+    let (min_idx, _) = eig
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("NaN encountered in eigenvalues"))
+        .expect("eigenvalues vector was empty");
+
+    let optimal_s_c = eig.eigenvectors.column(min_idx).into_owned().normalize();
+
+    // TODO: Dump the optimal_s_c and add it to the plotting script.
 
     // Dump the raw rayleigh-point mask and AoP values for testing.
     let filename = format!("rayleigh_point_{:04}.bin", frame.index);
