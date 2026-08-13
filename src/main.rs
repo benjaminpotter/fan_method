@@ -49,19 +49,21 @@
 //!   - Ensure all errors are handled: default to skip frame if problems arise
 //!   - Optimize "low hanging fruit" without spending too much time or too many changes on it
 //! - [x] Good logging to check on HPC job progress
-//! - [ ] Let user pass dataset path as argument (other arguments?)
-//! - [ ] SLURM script for starting the runner on the hpc [2]
+//! - [x] Let user pass dataset path as argument (other arguments?)
+//! - [x] SLURM script for starting the runner on the hpc [2]
 //!
 //! [1] https://ieeexplore.ieee.org/document/11005588
 //! [2] https://slurm.schedmd.com/overview.html
 
 use std::{
     collections::HashSet,
+    env,
     error::Error,
     f64::consts::{FRAC_PI_2, PI},
     fs::{File, OpenOptions},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
+    process,
     time::Instant,
 };
 
@@ -82,13 +84,11 @@ const CENTER_COL: usize = COLS / 2;
 const PIXEL_SIZE_MM: f64 = 0.0069;
 const FOCAL_LENGTH_MM: f64 = 8.0;
 const AOP_THRESHOLD_DEG: f64 = 5.0;
-const TIME_CSV: &'static str =
-    "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/novatel_oem7_time/novatel_oem7_time.csv";
-const INS_CSV: &'static str = "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/novatel_oem7_inspva/novatel_oem7_inspva.csv";
-const IMAGE_DIR: &'static str =
-    "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/camera_driver_gv_vis_image_raw";
-const OUTPUT_CSV: &'static str = "frame_results.csv";
-const N_FRAMES: usize = 10;
+const DEFAULT_TIME_CSV_REL: &str = "novatel_oem7_time/novatel_oem7_time.csv";
+const DEFAULT_INS_CSV_REL: &str = "novatel_oem7_inspva/novatel_oem7_inspva.csv";
+const DEFAULT_IMAGE_DIR_REL: &str = "camera_driver_gv_vis_image_raw";
+const DEFAULT_OUTPUT_CSV: &str = "frame_results.csv";
+const DEFAULT_FRAME_STRIDE: usize = 5;
 
 fn log_info(message: impl AsRef<str>) {
     println!("[{}] INFO: {}", Utc::now().to_rfc3339(), message.as_ref());
@@ -102,10 +102,159 @@ fn log_error(message: impl AsRef<str>) {
     eprintln!("[{}] ERROR: {}", Utc::now().to_rfc3339(), message.as_ref());
 }
 
+#[derive(Debug)]
+struct Config {
+    trajectory_dir: PathBuf,
+    time_csv: PathBuf,
+    ins_csv: PathBuf,
+    image_dir: PathBuf,
+    image_prefix: String,
+    output_csv: PathBuf,
+    frame_stride: usize,
+    start_frame: usize,
+    max_frames: Option<usize>,
+    shard_index: usize,
+    shard_count: usize,
+}
+
+impl Config {
+    fn parse() -> Result<Self, String> {
+        let mut trajectory_dir = None;
+        let mut time_csv = None;
+        let mut ins_csv = None;
+        let mut image_dir = None;
+        let mut image_prefix = None;
+        let mut output_csv = PathBuf::from(DEFAULT_OUTPUT_CSV);
+        let mut frame_stride = DEFAULT_FRAME_STRIDE;
+        let mut start_frame = 0usize;
+        let mut max_frames = None;
+        let mut shard_index = env::var("SLURM_ARRAY_TASK_ID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut shard_count = env::var("SLURM_ARRAY_TASK_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
+        let mut args = env::args().skip(1).peekable();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    print_usage();
+                    process::exit(0);
+                }
+                "--trajectory-dir" => {
+                    trajectory_dir = Some(PathBuf::from(next_arg(&mut args, &arg)?))
+                }
+                "--time-csv" => time_csv = Some(PathBuf::from(next_arg(&mut args, &arg)?)),
+                "--ins-csv" => ins_csv = Some(PathBuf::from(next_arg(&mut args, &arg)?)),
+                "--image-dir" => image_dir = Some(PathBuf::from(next_arg(&mut args, &arg)?)),
+                "--image-prefix" => image_prefix = Some(next_arg(&mut args, &arg)?),
+                "--output-csv" => output_csv = PathBuf::from(next_arg(&mut args, &arg)?),
+                "--frame-stride" => frame_stride = parse_usize_arg(&mut args, &arg)?,
+                "--start-frame" => start_frame = parse_usize_arg(&mut args, &arg)?,
+                "--max-frames" => max_frames = Some(parse_usize_arg(&mut args, &arg)?),
+                "--shard-index" => shard_index = parse_usize_arg(&mut args, &arg)?,
+                "--shard-count" => shard_count = parse_usize_arg(&mut args, &arg)?,
+                value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+                value => {
+                    if trajectory_dir.replace(PathBuf::from(value)).is_some() {
+                        return Err("multiple trajectory directories provided".to_string());
+                    }
+                }
+            }
+        }
+
+        let trajectory_dir =
+            trajectory_dir.ok_or_else(|| "missing trajectory directory".to_string())?;
+        let time_csv = time_csv.unwrap_or_else(|| trajectory_dir.join(DEFAULT_TIME_CSV_REL));
+        let ins_csv = ins_csv.unwrap_or_else(|| trajectory_dir.join(DEFAULT_INS_CSV_REL));
+        let image_dir = image_dir.unwrap_or_else(|| trajectory_dir.join(DEFAULT_IMAGE_DIR_REL));
+        let image_prefix = image_prefix.unwrap_or_else(|| {
+            image_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(DEFAULT_IMAGE_DIR_REL)
+                .to_string()
+        });
+
+        if frame_stride == 0 {
+            return Err("--frame-stride must be greater than zero".to_string());
+        }
+        if shard_count == 0 {
+            return Err("--shard-count must be greater than zero".to_string());
+        }
+        if shard_index >= shard_count {
+            return Err(format!(
+                "--shard-index ({shard_index}) must be less than --shard-count ({shard_count})"
+            ));
+        }
+
+        Ok(Self {
+            trajectory_dir,
+            time_csv,
+            ins_csv,
+            image_dir,
+            image_prefix,
+            output_csv,
+            frame_stride,
+            start_frame,
+            max_frames,
+            shard_index,
+            shard_count,
+        })
+    }
+}
+
+fn next_arg<I>(args: &mut std::iter::Peekable<I>, option: &str) -> Result<String, String>
+where
+    I: Iterator<Item = String>,
+{
+    args.next()
+        .ok_or_else(|| format!("missing value for {option}"))
+}
+
+fn parse_usize_arg<I>(args: &mut std::iter::Peekable<I>, option: &str) -> Result<usize, String>
+where
+    I: Iterator<Item = String>,
+{
+    next_arg(args, option)?
+        .parse()
+        .map_err(|_| format!("invalid integer value for {option}"))
+}
+
+fn print_usage() {
+    println!(
+        "Usage: fan_method [OPTIONS] <TRAJECTORY_DIR>\n\
+\n\
+Options:\n\
+  --trajectory-dir DIR   Trajectory directory (alternative to positional argument)\n\
+  --time-csv PATH        Time CSV [default: DIR/{DEFAULT_TIME_CSV_REL}]\n\
+  --ins-csv PATH         INS CSV [default: DIR/{DEFAULT_INS_CSV_REL}]\n\
+  --image-dir DIR        AoP image directory [default: DIR/{DEFAULT_IMAGE_DIR_REL}]\n\
+  --image-prefix PREFIX  Image filename prefix [default: basename of --image-dir]\n\
+  --output-csv PATH      Result CSV [default: {DEFAULT_OUTPUT_CSV}]\n\
+  --frame-stride N       Process every Nth frame [default: {DEFAULT_FRAME_STRIDE}]\n\
+  --start-frame N        First frame index to consider [default: 0]\n\
+  --max-frames N         Stop after N selected frames for this shard\n\
+  --shard-index N        Zero-based shard index [default: SLURM_ARRAY_TASK_ID or 0]\n\
+  --shard-count N        Number of shards [default: SLURM_ARRAY_TASK_COUNT or 1]\n\
+  -h, --help             Show this help"
+    );
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let config = Config::parse().map_err(|e| {
+        print_usage();
+        format!("configuration error: {e}")
+    })?;
+
     log_info("Fan Method v0.1");
     log_info("Implemented by Ben Potter in August 2026");
     log_info("See original paper: https://ieeexplore.ieee.org/document/11005588");
+    log_info(format!("Trajectory directory: {:?}", config.trajectory_dir));
+    log_info(format!("Configuration: {config:?}"));
 
     // Fixed rotations determined by experimental setup.
     //
@@ -122,7 +271,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Pixels whose measured AoP is close to the PSA/Rayleigh-predicted AoP are
     // treated as Rayleigh points and used for the filtered sun estimate.
     let aop_threshold_rad = AOP_THRESHOLD_DEG.to_radians();
-    let image_dir = PathBuf::new().join(IMAGE_DIR);
+    let image_dir = config.image_dir.clone();
 
     let mut all_p_c = Vec::new();
     let mut all_v_c = Vec::new();
@@ -153,36 +302,45 @@ fn main() -> Result<(), Box<dyn Error>> {
         n_pixels,
     };
 
-    let time_frame = fan_method::dataset::read_time(TIME_CSV)?;
-    let ins_frame = fan_method::dataset::read_ins(INS_CSV)?;
+    let time_frame = fan_method::dataset::read_time(&config.time_csv)?;
+    let ins_frame = fan_method::dataset::read_ins(&config.ins_csv)?;
     let n_available_frames = time_frame.len().min(ins_frame.len());
-    let n_frames_to_process = N_FRAMES.min(n_available_frames);
-
-    if N_FRAMES > n_available_frames {
-        log_warn(format!(
-            "Requested {N_FRAMES} frames, but only {n_available_frames} synchronized time/INS rows are available; processing {n_frames_to_process} frames."
-        ));
-    }
 
     // Open the CSV before the long-running loop and flush after every successful frame.
     // This makes the output a useful checkpoint: if the job is killed, completed frames
     // are already on disk and do not need to be recomputed.
-    let completed_frames = read_completed_frame_indices(OUTPUT_CSV)?;
-    let mut writer = open_frame_results_writer(OUTPUT_CSV, !completed_frames.is_empty())?;
+    let completed_frames = read_completed_frame_indices(&config.output_csv)?;
+    let mut writer = open_frame_results_writer(&config.output_csv, !completed_frames.is_empty())?;
     if completed_frames.is_empty() {
         write_frame_results_header(&mut writer)?;
         writer.flush()?;
     } else {
         log_info(format!(
-            "Found {} completed frames in {OUTPUT_CSV}; appending new results and skipping completed frames.",
-            completed_frames.len()
+            "Found {} completed frames in {:?}; appending new results and skipping completed frames.",
+            completed_frames.len(),
+            config.output_csv
         ));
     }
 
     let mut n_processed = 0usize;
     let mut n_skipped = 0usize;
     let mut n_already_completed = 0usize;
-    for i in 0..n_frames_to_process {
+    let mut n_selected_for_shard = 0usize;
+    for i in config.start_frame..n_available_frames {
+        if (i - config.start_frame) % config.frame_stride != 0 {
+            continue;
+        }
+        if n_selected_for_shard % config.shard_count != config.shard_index {
+            n_selected_for_shard += 1;
+            continue;
+        }
+        n_selected_for_shard += 1;
+        if let Some(max_frames) = config.max_frames {
+            if n_processed + n_skipped + n_already_completed >= max_frames {
+                break;
+            }
+        }
+
         if completed_frames.contains(&i) {
             n_already_completed += 1;
             continue;
@@ -206,7 +364,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // Load the measured angle of polarization (AoP) image for this frame. The
         // dataset reader returns one AoP value per pixel in sensor/image coordinates.
-        let image_file = format!("camera_driver_gv_vis_image_raw_{:04}.png", i);
+        let image_file = format!("{}_{:04}.png", config.image_prefix, i);
         let image_file = image_dir.join(image_file);
         let aop = match fan_method::dataset::read_image(&image_file) {
             Ok(aop) => aop,
@@ -268,7 +426,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     log_info(format!(
-        "Finished runner: processed {n_processed} frames, skipped {n_skipped}, already completed {n_already_completed}; results written to {OUTPUT_CSV}."
+        "Finished runner: processed {n_processed} frames, skipped {n_skipped}, already completed {n_already_completed}; results written to {:?}.",
+        config.output_csv
     ));
 
     Ok(())
