@@ -8,5 +8,6 @@ chrono = "0.4.45"
 csv = "1.4.0"
 image = "0.25.10"
 nalgebra = "0.35.0"
+rayon = "1.11.0"
 rumpus = { path = "/home/ben/git/research/rumpus" }
 spa = "0.5.1"

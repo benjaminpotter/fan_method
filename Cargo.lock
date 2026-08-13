@@ -331,6 +331,7 @@ dependencies = [
  "csv",
  "image",
  "nalgebra 0.35.0",
+ "rayon",
  "rumpus",
  "spa",
 ]

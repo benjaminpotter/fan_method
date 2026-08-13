@@ -42,7 +42,8 @@
 //! - [x] Dump the frame result structure as a CSV file
 //!   - Ensure the file has a descriptive name
 //!   - Unpack the vectors into NAME.x, NAME.y, NAME.z fields
-//! - [ ] Add comments throughout that explain the implementation of the algorithm
+//! - [x] Add comments throughout that explain the implementation of the algorithm
+//! - [ ] Optimize for HPC context -> parallelize?
 //! - [ ] Ensure no crashes during long running HPC job
 //!   - Checkpointing
 //!   - Ensure all errors are handled: default to skip frame if problems arise
@@ -63,10 +64,12 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use fan_method::{
-    aop_from_ev, aop_sensor_to_v, compute_azimuth, compute_rot_v_c, compute_s_c, elapsed_ms,
-    ev_from_aop, optical_path, pixel, psa, rayleigh_ev, tait_bryan,
+    accumulate_e_vector, aop_from_ev, aop_sensor_to_v, compute_azimuth, compute_rot_v_c,
+    compute_s_c_from_matrix, elapsed_ms, ev_from_aop, optical_path, pixel, psa, rayleigh_ev,
+    tait_bryan,
 };
-use nalgebra::{Rotation3, Vector3};
+use nalgebra::{Matrix3, Rotation3, Vector3};
+use rayon::prelude::*;
 
 const ROWS: usize = 1024;
 const COLS: usize = 1224;
@@ -259,6 +262,35 @@ struct FrameResult {
     eigendecomp_duration_ms: f64,
 }
 
+/// Per-pixel contributions reduced across the image during frame processing.
+#[derive(Clone)]
+struct PixelAccum {
+    /// Normal-equation matrix accumulated from all measured e-vectors.
+    m_all: Matrix3<f64>,
+    /// Normal-equation matrix accumulated only from Rayleigh-classified e-vectors.
+    m_rayleigh: Matrix3<f64>,
+    /// Number of pixels classified as Rayleigh points.
+    n_rayleigh_points: usize,
+}
+
+impl PixelAccum {
+    fn zero() -> Self {
+        Self {
+            m_all: Matrix3::zeros(),
+            m_rayleigh: Matrix3::zeros(),
+            n_rayleigh_points: 0,
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self {
+            m_all: self.m_all + other.m_all,
+            m_rayleigh: self.m_rayleigh + other.m_rayleigh,
+            n_rayleigh_points: self.n_rayleigh_points + other.n_rayleigh_points,
+        }
+    }
+}
+
 /// Process a single trajectory frame with the Fan-method pipeline.
 ///
 /// The high-level flow is:
@@ -277,51 +309,51 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let psa_s_c = frame.rot_c_n * psa_s_n;
     let psa_duration_ms = elapsed_ms(psa_start);
 
-    // Per-pixel working buffers:
-    // - `aop_v`: measured AoP re-expressed in each pixel's observation frame.
-    // - `rayleigh_aop_v`: AoP predicted by the Rayleigh model using PSA sun direction.
-    // - `rayleigh_point`: whether measured and predicted AoP agree within threshold.
-    // - `e_c`: measured polarization e-vectors rotated back into the camera frame.
-    let mut aop_v = vec![0f64; system.n_pixels];
-    let mut rayleigh_aop_v = vec![0f64; system.n_pixels];
-    let mut n_rayleigh_points = 0usize;
-    let mut rayleigh_point = vec![false; system.n_pixels];
-    let mut e_c = vec![Vector3::zeros(); system.n_pixels];
-
+    // Process pixels in parallel. Each worker builds local `3x3` normal-equation
+    // matrices, then Rayon reduces those local matrices into frame-level totals. This
+    // avoids locks, avoids storing one e-vector per pixel, and keeps eigendecomposition
+    // limited to two tiny `3x3` matrices after the parallel pixel pass.
     let pixel_loop_start = Instant::now();
-    for i in 0..system.n_pixels {
-        let v_c = &system.all_v_c[i];
+    let pixel_accum = (0..system.n_pixels)
+        .into_par_iter()
+        .map(|i| {
+            let v_c = &system.all_v_c[i];
 
-        // Predict the Rayleigh e-vector for this optical path using the PSA sun
-        // direction. This predicted polarization direction is used only to decide
-        // whether the pixel behaves like a Rayleigh point.
-        let rayleigh_e_c = rayleigh_ev(v_c, &psa_s_c);
+            // Predict the Rayleigh e-vector for this optical path using the PSA sun
+            // direction. This predicted polarization direction is used only to decide
+            // whether the pixel behaves like a Rayleigh point.
+            let rayleigh_e_c = rayleigh_ev(v_c, &psa_s_c);
 
-        // The Fan method defines a local observation frame (v-frame) for each pixel,
-        // with +Z along that pixel's optical path. AoP comparisons are made in this
-        // frame because AoP is measured in the plane perpendicular to the observation
-        // direction.
-        let rot_v_c = compute_rot_v_c(v_c);
-        let rayleigh_e_v = rot_v_c * rayleigh_e_c;
+            // The Fan method defines a local observation frame (v-frame) for each pixel,
+            // with +Z along that pixel's optical path. AoP comparisons are made in this
+            // frame because AoP is measured in the plane perpendicular to the observation
+            // direction.
+            let rot_v_c = compute_rot_v_c(v_c);
+            let rayleigh_e_v = rot_v_c * rayleigh_e_c;
 
-        // Convert the measured sensor AoP into the pixel's v-frame, convert the
-        // predicted Rayleigh e-vector into its AoP, then compare the two axial angles.
-        aop_v[i] = aop_sensor_to_v(frame.aop_s[i], system.all_p_c[i]);
-        rayleigh_aop_v[i] = aop_from_ev(&rayleigh_e_v);
-        rayleigh_point[i] =
-            fan_method::aop_threshold(aop_v[i], rayleigh_aop_v[i], system.aop_threshold_rad);
+            // Convert the measured sensor AoP into the pixel's v-frame, convert the
+            // predicted Rayleigh e-vector into its AoP, then compare the two axial angles.
+            let aop_v = aop_sensor_to_v(frame.aop_s[i], system.all_p_c[i]);
+            let rayleigh_aop_v = aop_from_ev(&rayleigh_e_v);
+            let is_rayleigh_point =
+                fan_method::aop_threshold(aop_v, rayleigh_aop_v, system.aop_threshold_rad);
 
-        if rayleigh_point[i] {
-            n_rayleigh_points += 1;
-        }
+            // Convert the measured AoP into a unit e-vector in the v-frame, then rotate it
+            // back into the camera frame. The eigendecomposition later uses these camera-
+            // frame e-vectors to find the sun direction most nearly perpendicular to them.
+            let rot_c_v = rot_v_c.inverse();
+            let e_v = ev_from_aop(aop_v);
+            let e_c = rot_c_v * e_v;
 
-        // Convert the measured AoP into a unit e-vector in the v-frame, then rotate it
-        // back into the camera frame. The eigendecomposition later uses these camera-
-        // frame e-vectors to find the sun direction most nearly perpendicular to them.
-        let rot_c_v = rot_v_c.inverse();
-        let e_v = ev_from_aop(aop_v[i]);
-        e_c[i] = rot_c_v * e_v;
-    }
+            let mut accum = PixelAccum::zero();
+            accumulate_e_vector(&mut accum.m_all, &e_c);
+            if is_rayleigh_point {
+                accumulate_e_vector(&mut accum.m_rayleigh, &e_c);
+                accum.n_rayleigh_points = 1;
+            }
+            accum
+        })
+        .reduce(PixelAccum::zero, PixelAccum::combine);
     let pixel_loop_duration_ms = elapsed_ms(pixel_loop_start);
 
     let eigendecomp_start = Instant::now();
@@ -330,24 +362,19 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     // scattering, every valid e-vector is perpendicular to the solar vector; therefore
     // the best-fit sun vector is the unit vector that minimizes summed squared dot
     // products with all e-vectors, solved via eigendecomposition.
-    let s_c = compute_s_c(&e_c);
+    let s_c = compute_s_c_from_matrix(pixel_accum.m_all);
 
     // Repeat the same eigendecomposition using only pixels classified as Rayleigh
     // points. This filtered estimate should be less affected by clouds, reflections,
     // saturation, or other pixels whose AoP does not follow the Rayleigh model.
-    let rayleigh_e_c: Vec<_> = e_c
-        .iter()
-        .zip(rayleigh_point.iter())
-        .filter_map(|(e_c, is_rayleigh_point)| is_rayleigh_point.then_some(*e_c))
-        .collect();
-    let rayleigh_s_c = if rayleigh_e_c.is_empty() {
+    let rayleigh_s_c = if pixel_accum.n_rayleigh_points == 0 {
         eprintln!(
             "frame {} had no rayleigh points; falling back to all e-vectors for rayleigh_s_c",
             frame.index
         );
         s_c
     } else {
-        compute_s_c(&rayleigh_e_c)
+        compute_s_c_from_matrix(pixel_accum.m_rayleigh)
     };
     let eigendecomp_duration_ms = elapsed_ms(eigendecomp_start);
     let total_duration_ms = elapsed_ms(total_start);
@@ -358,6 +385,7 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let psa_azimuth = compute_azimuth(&psa_s_c);
     let azimuth = compute_azimuth(&s_c);
     let rayleigh_azimuth = compute_azimuth(&rayleigh_s_c);
+    let n_rayleigh_points = pixel_accum.n_rayleigh_points;
     let frac_rayleigh_points = n_rayleigh_points as f64 / system.n_pixels as f64;
 
     FrameResult {

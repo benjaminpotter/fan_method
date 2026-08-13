@@ -51,6 +51,15 @@ pub fn compute_azimuth(v: &Vector3<f64>) -> f64 {
 pub fn compute_s_c(e_c: &[Vector3<f64>]) -> Vector3<f64> {
     let a = Matrix3xX::from_columns(e_c);
     let m = &a * a.transpose();
+    compute_s_c_from_matrix(m)
+}
+
+/// Compute the optimal solar vector from a pre-accumulated `sum(e * e^T)` matrix.
+///
+/// This is equivalent to [`compute_s_c`] but avoids storing all e-vectors or building
+/// a large `3 x N` matrix. It is useful when e-vectors are accumulated in a streaming
+/// or parallel reduction.
+pub fn compute_s_c_from_matrix(m: Matrix3<f64>) -> Vector3<f64> {
     let eig = m.symmetric_eigen();
     let (min_idx, _) = eig
         .eigenvalues
@@ -60,6 +69,11 @@ pub fn compute_s_c(e_c: &[Vector3<f64>]) -> Vector3<f64> {
         .expect("eigenvalues vector was empty");
 
     eig.eigenvectors.column(min_idx).into_owned().normalize()
+}
+
+/// Accumulate an e-vector into the normal-equation matrix used by [`compute_s_c_from_matrix`].
+pub fn accumulate_e_vector(m: &mut Matrix3<f64>, e: &Vector3<f64>) {
+    *m += e * e.transpose();
 }
 
 /// Build a 3D rotation from ZYX Tait-Bryan angles.
@@ -244,6 +258,23 @@ mod tests {
         let e_c = [Vector3::x(), Vector3::y()];
         let s_c = compute_s_c(&e_c);
         assert!(s_c.z.abs() > 1.0 - 1e-12);
+    }
+
+    #[test]
+    fn compute_s_c_from_matrix_matches_vector_form() {
+        let e_c = [
+            Vector3::x(),
+            Vector3::y(),
+            Vector3::new(1.0, 1.0, 0.0).normalize(),
+        ];
+        let mut m = Matrix3::zeros();
+        for e in &e_c {
+            accumulate_e_vector(&mut m, e);
+        }
+
+        let from_vectors = compute_s_c(&e_c);
+        let from_matrix = compute_s_c_from_matrix(m);
+        assert!((from_vectors.dot(&from_matrix).abs() - 1.0).abs() < 1e-12);
     }
 
     #[test]
