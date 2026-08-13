@@ -3,7 +3,11 @@
 # SLURM script for running the Rust Fan-method runner (`src/main.rs`) on an HPC
 # cluster. Submit with, for example:
 #
+#   mkdir -p slurm_logs
 #   TRAJECTORY_DIR=/path/to/trajectory sbatch driver.sh
+#
+# SLURM opens stdout/stderr before this script starts, so the slurm_logs/
+# directory must exist before calling sbatch.
 #
 # By default this is an array job. Each array task processes a disjoint shard of
 # every fifth frame (5 Hz input -> 1 Hz results) and writes its own checkpoint CSV.
@@ -16,8 +20,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --array=0-15%4
-#SBATCH --output=fan-method_%A_%a.out
-#SBATCH --error=fan-method_%A_%a.err
+#SBATCH --output=slurm_logs/%x_%A_%a.out
+#SBATCH --error=slurm_logs/%x_%A_%a.err
 
 set -euo pipefail
 
@@ -32,7 +36,7 @@ if [[ -n "${MAX_FRAMES:-}" ]]; then
   MAX_FRAMES_ARG=(--max-frames "$MAX_FRAMES")
 fi
 
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR" "$PROJECT_DIR/slurm_logs"
 cd "$PROJECT_DIR"
 
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$SLURM_CPUS_PER_TASK}"
