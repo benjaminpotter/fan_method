@@ -90,18 +90,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("See original paper: https://ieeexplore.ieee.org/document/11005588");
 
     // Fixed rotations determined by experimental setup.
+    //
+    // The algorithm estimates the sun direction in the camera optical frame (c-frame),
+    // but the reference INS attitude is provided for the car body frame (bcar-frame).
+    // These fixed rotations describe how the camera was mounted in the vehicle, so
+    // they let us move vectors between the car body, camera body, and camera optical
+    // frames.
     let rot_bcam_bcar = tait_bryan(PI, 0., 0.);
     let rot_c_bcam = tait_bryan(0., 0., 0.);
     let rot_c_bcar = rot_c_bcam * rot_bcam_bcar;
 
     let n_pixels = N_PIXELS;
+    // Pixels whose measured AoP is close to the PSA/Rayleigh-predicted AoP are
+    // treated as Rayleigh points and used for the filtered sun estimate.
     let aop_threshold_rad = AOP_THRESHOLD_DEG.to_radians();
     let image_dir = PathBuf::new().join(IMAGE_DIR);
 
     let mut all_p_c = Vec::new();
     let mut all_v_c = Vec::new();
 
-    // Compute the optical paths once at startup.
+    // Compute camera-frame pixel locations and optical-path vectors once at startup.
+    // These depend only on the camera geometry, not on the frame's time, pose, or image
+    // data, so caching them avoids repeating this work for every image.
     let optical_paths_start = Instant::now();
     for row in 0..ROWS {
         for col in 0..COLS {
@@ -146,7 +156,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         let rot_c_n = rot_c_bcar * rot_n_bcar.inverse();
 
-        // Compute measured aop from image.
+        // Load the measured angle of polarization (AoP) image for this frame. The
+        // dataset reader returns one AoP value per pixel in sensor/image coordinates.
         let image_file = format!("camera_driver_gv_vis_image_raw_{:04}.png", i);
         let image_file = image_dir.join(image_file);
         let aop = match fan_method::dataset::read_image(image_file) {
@@ -248,15 +259,29 @@ struct FrameResult {
     eigendecomp_duration_ms: f64,
 }
 
-/// The meat and potatoes of the algorithm.
+/// Process a single trajectory frame with the Fan-method pipeline.
+///
+/// The high-level flow is:
+/// 1. Use PSA as a reference solar direction for Rayleigh-point classification.
+/// 2. Convert every measured pixel AoP into an e-vector in the camera frame.
+/// 3. Classify pixels whose measured AoP agrees with the PSA/Rayleigh prediction.
+/// 4. Estimate the solar direction from all e-vectors and from Rayleigh-filtered e-vectors.
 fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let total_start = Instant::now();
 
+    // PSA gives an independent reference sun vector in the local horizontal ENU
+    // frame. Rotate it into the camera optical frame so it can be compared against
+    // per-pixel optical paths and e-vectors.
     let psa_start = Instant::now();
     let psa_s_n = psa(frame.lat, frame.lon, frame.time);
     let psa_s_c = frame.rot_c_n * psa_s_n;
     let psa_duration_ms = elapsed_ms(psa_start);
 
+    // Per-pixel working buffers:
+    // - `aop_v`: measured AoP re-expressed in each pixel's observation frame.
+    // - `rayleigh_aop_v`: AoP predicted by the Rayleigh model using PSA sun direction.
+    // - `rayleigh_point`: whether measured and predicted AoP agree within threshold.
+    // - `e_c`: measured polarization e-vectors rotated back into the camera frame.
     let mut aop_v = vec![0f64; system.n_pixels];
     let mut rayleigh_aop_v = vec![0f64; system.n_pixels];
     let mut n_rayleigh_points = 0usize;
@@ -266,11 +291,21 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let pixel_loop_start = Instant::now();
     for i in 0..system.n_pixels {
         let v_c = &system.all_v_c[i];
+
+        // Predict the Rayleigh e-vector for this optical path using the PSA sun
+        // direction. This predicted polarization direction is used only to decide
+        // whether the pixel behaves like a Rayleigh point.
         let rayleigh_e_c = rayleigh_ev(v_c, &psa_s_c);
 
+        // The Fan method defines a local observation frame (v-frame) for each pixel,
+        // with +Z along that pixel's optical path. AoP comparisons are made in this
+        // frame because AoP is measured in the plane perpendicular to the observation
+        // direction.
         let rot_v_c = compute_rot_v_c(v_c);
         let rayleigh_e_v = rot_v_c * rayleigh_e_c;
 
+        // Convert the measured sensor AoP into the pixel's v-frame, convert the
+        // predicted Rayleigh e-vector into its AoP, then compare the two axial angles.
         aop_v[i] = aop_sensor_to_v(frame.aop_s[i], system.all_p_c[i]);
         rayleigh_aop_v[i] = aop_from_ev(&rayleigh_e_v);
         rayleigh_point[i] =
@@ -280,6 +315,9 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
             n_rayleigh_points += 1;
         }
 
+        // Convert the measured AoP into a unit e-vector in the v-frame, then rotate it
+        // back into the camera frame. The eigendecomposition later uses these camera-
+        // frame e-vectors to find the sun direction most nearly perpendicular to them.
         let rot_c_v = rot_v_c.inverse();
         let e_v = ev_from_aop(aop_v[i]);
         e_c[i] = rot_c_v * e_v;
@@ -287,7 +325,16 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let pixel_loop_duration_ms = elapsed_ms(pixel_loop_start);
 
     let eigendecomp_start = Instant::now();
+
+    // Estimate the sun direction from all measured e-vectors. For ideal Rayleigh
+    // scattering, every valid e-vector is perpendicular to the solar vector; therefore
+    // the best-fit sun vector is the unit vector that minimizes summed squared dot
+    // products with all e-vectors, solved via eigendecomposition.
     let s_c = compute_s_c(&e_c);
+
+    // Repeat the same eigendecomposition using only pixels classified as Rayleigh
+    // points. This filtered estimate should be less affected by clouds, reflections,
+    // saturation, or other pixels whose AoP does not follow the Rayleigh model.
     let rayleigh_e_c: Vec<_> = e_c
         .iter()
         .zip(rayleigh_point.iter())
@@ -305,6 +352,9 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let eigendecomp_duration_ms = elapsed_ms(eigendecomp_start);
     let total_duration_ms = elapsed_ms(total_start);
 
+    // Collapse the three solar vectors to horizontal azimuth angles for easier
+    // comparison in downstream analysis. The full vectors are still retained in the
+    // CSV output.
     let psa_azimuth = compute_azimuth(&psa_s_c);
     let azimuth = compute_azimuth(&s_c);
     let rayleigh_azimuth = compute_azimuth(&rayleigh_s_c);
@@ -331,6 +381,10 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
 }
 
 /// Write frame results to a CSV file, unpacking vector fields into x/y/z columns.
+///
+/// This produces one row per processed image frame. Vectors are flattened into scalar
+/// columns so the output can be consumed directly by pandas, spreadsheets, plotting
+/// tools, or HPC post-processing scripts.
 fn write_frame_results(
     path: impl AsRef<Path>,
     results: &[FrameResult],
