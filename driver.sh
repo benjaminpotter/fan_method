@@ -38,13 +38,33 @@ cd "$PROJECT_DIR"
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$SLURM_CPUS_PER_TASK}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 
-cargo build --release --locked
+# Make Rust/Cargo available on clusters where non-interactive SLURM shells do not
+# inherit your login-shell PATH. You may set RUST_MODULE, e.g.
+#   sbatch --export=ALL,TRAJECTORY_DIR=/data/traj,RUST_MODULE=rust driver.sh
+if [[ -n "${RUST_MODULE:-}" ]]; then
+  module load "$RUST_MODULE"
+elif [[ -f "${CARGO_ENV:-$HOME/.cargo/env}" ]]; then
+  # rustup installs this file; it prepends $HOME/.cargo/bin to PATH.
+  # shellcheck disable=SC1090
+  source "${CARGO_ENV:-$HOME/.cargo/env}"
+fi
+
+BINARY="$PROJECT_DIR/target/release/fan_method"
+if command -v cargo >/dev/null 2>&1; then
+  cargo build --release --locked
+elif [[ -x "$BINARY" ]]; then
+  echo "warning: cargo not found; using existing binary at $BINARY" >&2
+else
+  echo "error: cargo not found and no executable exists at $BINARY" >&2
+  echo "Install/load Rust on the compute node, set RUST_MODULE, source ~/.cargo/env, or pre-build target/release/fan_method before submitting." >&2
+  exit 1
+fi
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-1}"
 OUTPUT_CSV="$OUTPUT_DIR/frame_results_shard_${TASK_ID}_of_${TASK_COUNT}.csv"
 
-srun "$PROJECT_DIR/target/release/fan_method" \
+srun "$BINARY" \
   --trajectory-dir "$TRAJECTORY_DIR" \
   --output-csv "$OUTPUT_CSV" \
   --frame-stride "$FRAME_STRIDE" \
