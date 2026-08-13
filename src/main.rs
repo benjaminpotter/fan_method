@@ -201,7 +201,13 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
 
     let optimal_s_c = eig.eigenvectors.column(min_idx).into_owned().normalize();
 
-    // TODO: Dump the optimal_s_c and add it to the plotting script.
+    let filename = format!("optimal_s_c_{:04}.bin", frame.index);
+    let file = std::fs::File::create(filename).unwrap();
+    let mut writer = BufWriter::new(file);
+
+    for &value in optimal_s_c.iter() {
+        writer.write_all(&value.to_be_bytes()).unwrap();
+    }
 
     // Dump the raw rayleigh-point mask and AoP values for testing.
     let filename = format!("rayleigh_point_{:04}.bin", frame.index);

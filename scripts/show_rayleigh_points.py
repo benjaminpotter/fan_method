@@ -3,8 +3,10 @@ Show the rayleigh points, Rayleigh AoP, and measured AoP dumps as image plots.
 
 The Rust executable dumps raw uint8 rayleigh_point data in row-major order, where
 each byte is 0 or 1 for a single pixel. It also dumps rayleigh_aop_v, aop_s, and
-aop_v data as big-endian f64 radians in row-major order. This script reshapes the
-dumps into the camera image shape and displays them with matplotlib.
+aop_v data as big-endian f64 radians in row-major order, plus optimal_s_c as three
+big-endian f64 c-frame vector components. This script reshapes the image dumps,
+projects the optimal solar vector into the image when possible, overlays its
+x_c-y_c azimuth as an arrow, and displays the plots with matplotlib.
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ import numpy as np
 ROWS = 1024
 COLS = 1224
 EXPECTED_PIXELS = ROWS * COLS
+PIXEL_SIZE_MM = 0.0069
+FOCAL_LENGTH_MM = 8.0
 
 
 def latest_dump(pattern: str) -> Path:
@@ -46,6 +50,12 @@ def matching_aop_v_dump(rayleigh_dump: Path) -> Path:
     )
 
 
+def matching_optimal_s_c_dump(rayleigh_dump: Path) -> Path:
+    return rayleigh_dump.with_name(
+        rayleigh_dump.name.replace("rayleigh_point_", "optimal_s_c_", 1)
+    )
+
+
 def read_dump(path: Path, dtype: np.dtype, rows: int, cols: int) -> np.ndarray:
     data = np.fromfile(path, dtype=dtype)
     expected_pixels = rows * cols
@@ -68,6 +78,27 @@ def read_aop(path: Path, rows: int, cols: int) -> np.ndarray:
     return read_dump(path, np.dtype(">f8"), rows, cols)
 
 
+def read_optimal_s_c(path: Path) -> np.ndarray:
+    # src/main.rs writes f64::to_be_bytes(), so read as big-endian float64.
+    data = np.fromfile(path, dtype=np.dtype(">f8"))
+    if data.size != 3:
+        raise ValueError(f"{path} contains {data.size} values, expected 3")
+    return data
+
+
+def project_c_frame_vector(
+    vector: np.ndarray, rows: int, cols: int, pixel_size_mm: float, focal_length_mm: float
+) -> tuple[float, float] | None:
+    if not np.all(np.isfinite(vector)) or vector[2] <= 0.0:
+        return None
+
+    center_row = rows // 2
+    center_col = cols // 2
+    col = center_col + focal_length_mm * vector[0] / (vector[2] * pixel_size_mm)
+    row = center_row + focal_length_mm * vector[1] / (vector[2] * pixel_size_mm)
+    return row, col
+
+
 def add_center_pixel_grid(ax: plt.Axes, rows: int, cols: int) -> None:
     center_row = rows // 2
     center_col = cols // 2
@@ -76,6 +107,56 @@ def add_center_pixel_grid(ax: plt.Axes, rows: int, cols: int) -> None:
     ax.axhline(center_row, color="white", linestyle="--", linewidth=0.8, alpha=0.9)
     ax.axvline(center_col, color="black", linestyle=":", linewidth=0.8, alpha=0.9)
     ax.axhline(center_row, color="black", linestyle=":", linewidth=0.8, alpha=0.9)
+
+
+def add_projected_vector(ax: plt.Axes, row_col: tuple[float, float] | None) -> None:
+    if row_col is None:
+        return
+
+    row, col = row_col
+    ax.plot(col, row, marker="x", markersize=12, markeredgewidth=2.5, color="lime")
+    ax.text(
+        col + 8,
+        row + 8,
+        "optimal $s_c$",
+        color="lime",
+        fontsize=9,
+        weight="bold",
+        bbox={"facecolor": "black", "alpha": 0.5, "pad": 2},
+    )
+
+
+def add_xy_azimuth_arrow(
+    ax: plt.Axes, vector: np.ndarray, rows: int, cols: int
+) -> float | None:
+    xy_norm = np.linalg.norm(vector[:2])
+    if not np.all(np.isfinite(vector[:2])) or xy_norm <= 0.0:
+        return None
+
+    center_row = rows // 2
+    center_col = cols // 2
+    unit_xy = vector[:2] / xy_norm
+    arrow_len = 0.18 * min(rows, cols)
+    dx = arrow_len * unit_xy[0]
+    dy = arrow_len * unit_xy[1]
+    azimuth_rad = np.arctan2(unit_xy[1], unit_xy[0])
+
+    ax.annotate(
+        "",
+        xy=(center_col + dx, center_row + dy),
+        xytext=(center_col, center_row),
+        arrowprops={"arrowstyle": "->", "color": "cyan", "lw": 2.5},
+    )
+    ax.text(
+        center_col + dx + 8,
+        center_row + dy + 8,
+        f"az={np.rad2deg(azimuth_rad):.1f}°",
+        color="cyan",
+        fontsize=9,
+        weight="bold",
+        bbox={"facecolor": "black", "alpha": 0.5, "pad": 2},
+    )
+    return float(azimuth_rad)
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,6 +202,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--optimal-s-c-dump",
+        type=Path,
+        help=(
+            "optimal_s_c_*.bin c-frame solar-vector file to use. Defaults to the "
+            "file matching the rayleigh_point frame, or the latest optimal_s_c_*.bin "
+            "if no match exists."
+        ),
+    )
+    parser.add_argument(
         "--aop-cmap", default="jet", help="AoP heatmap colormap, default twilight"
     )
     parser.add_argument(
@@ -146,11 +236,18 @@ def main() -> None:
     aop_v_dump = args.aop_v_dump or matching_aop_v_dump(dump)
     if not aop_v_dump.exists():
         aop_v_dump = latest_dump("aop_v_*.bin")
+    optimal_s_c_dump = args.optimal_s_c_dump or matching_optimal_s_c_dump(dump)
+    if not optimal_s_c_dump.exists():
+        optimal_s_c_dump = latest_dump("optimal_s_c_*.bin")
 
     image = read_rayleigh_points(dump, args.rows, args.cols)
     rayleigh_aop_v = read_aop(aop_dump, args.rows, args.cols)
     aop_s = read_aop(aop_s_dump, args.rows, args.cols)
     aop_v = read_aop(aop_v_dump, args.rows, args.cols)
+    optimal_s_c = read_optimal_s_c(optimal_s_c_dump)
+    optimal_s_c_projection = project_c_frame_vector(
+        optimal_s_c, args.rows, args.cols, PIXEL_SIZE_MM, FOCAL_LENGTH_MM
+    )
     rayleigh_aop_v_deg = np.rad2deg(rayleigh_aop_v)
     aop_s_deg = np.rad2deg(aop_s)
     aop_v_deg = np.rad2deg(aop_v)
@@ -200,12 +297,34 @@ def main() -> None:
     aop_v_ax.set_ylabel("Row")
     fig.colorbar(aop_v_im, ax=aop_v_ax, label="Measured AoP v-frame (deg)")
 
+    optimal_s_c_azimuth = None
+    for ax in (image_ax, aop_ax, aop_s_ax, aop_v_ax):
+        add_projected_vector(ax, optimal_s_c_projection)
+        azimuth = add_xy_azimuth_arrow(ax, optimal_s_c, args.rows, args.cols)
+        if optimal_s_c_azimuth is None:
+            optimal_s_c_azimuth = azimuth
+
     for ax in (aop_ax, aop_s_ax, aop_v_ax):
         add_center_pixel_grid(ax, args.rows, args.cols)
 
     n_rayleigh = int(np.count_nonzero(image))
     percent = 100.0 * n_rayleigh / image.size
     print(f"{dump}: {n_rayleigh}/{image.size} rayleigh points ({percent:.2f}%)")
+    projection_text = (
+        "not projected (non-finite or z <= 0)"
+        if optimal_s_c_projection is None
+        else f"projected row={optimal_s_c_projection[0]:.2f}, col={optimal_s_c_projection[1]:.2f}"
+    )
+    azimuth_text = (
+        "azimuth unavailable (non-finite or zero x_c-y_c norm)"
+        if optimal_s_c_azimuth is None
+        else f"x_c-y_c azimuth={np.rad2deg(optimal_s_c_azimuth):.2f} deg"
+    )
+    print(
+        f"{optimal_s_c_dump}: optimal_s_c=[{optimal_s_c[0]:.6f}, "
+        f"{optimal_s_c[1]:.6f}, {optimal_s_c[2]:.6f}], {projection_text}, "
+        f"{azimuth_text}"
+    )
     print(
         f"{aop_dump}: Rayleigh AoP v-frame deg min={finite_rayleigh_aop_v_deg.min():.2f}, "
         f"max={finite_rayleigh_aop_v_deg.max():.2f}, "
