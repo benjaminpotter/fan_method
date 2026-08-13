@@ -43,7 +43,7 @@
 //!   - Ensure the file has a descriptive name
 //!   - Unpack the vectors into NAME.x, NAME.y, NAME.z fields
 //! - [x] Add comments throughout that explain the implementation of the algorithm
-//! - [ ] Optimize for HPC context -> parallelize?
+//! - [x] Optimize for HPC context -> parallelize?
 //! - [ ] Ensure no crashes during long running HPC job
 //!   - Checkpointing
 //!   - Ensure all errors are handled: default to skip frame if problems arise
@@ -56,8 +56,11 @@
 //! [2] https://slurm.schedmd.com/overview.html
 
 use std::{
+    collections::HashSet,
     error::Error,
     f64::consts::{FRAC_PI_2, PI},
+    fs::{File, OpenOptions},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -85,7 +88,7 @@ const INS_CSV: &'static str = "/home/ben/git/research/polcam_dataset/2025-11-24/
 const IMAGE_DIR: &'static str =
     "/home/ben/git/research/polcam_dataset/2025-11-24/rmc/camera_driver_gv_vis_image_raw";
 const OUTPUT_CSV: &'static str = "frame_results.csv";
-const N_FRAMES: usize = 1;
+const N_FRAMES: usize = 10;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Fan Method v0.1");
@@ -138,10 +141,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         n_pixels,
     };
 
-    let time_frame = fan_method::dataset::read_time(TIME_CSV).unwrap();
-    let ins_frame = fan_method::dataset::read_ins(INS_CSV).unwrap();
-    let mut results = Vec::new();
-    for i in 0..N_FRAMES {
+    let time_frame = fan_method::dataset::read_time(TIME_CSV)?;
+    let ins_frame = fan_method::dataset::read_ins(INS_CSV)?;
+    let n_available_frames = time_frame.len().min(ins_frame.len());
+    let n_frames_to_process = N_FRAMES.min(n_available_frames);
+
+    if N_FRAMES > n_available_frames {
+        eprintln!(
+            "requested {N_FRAMES} frames but only {n_available_frames} synchronized time/INS rows are available; processing {n_frames_to_process} frames"
+        );
+    }
+
+    // Open the CSV before the long-running loop and flush after every successful frame.
+    // This makes the output a useful checkpoint: if the job is killed, completed frames
+    // are already on disk and do not need to be recomputed.
+    let completed_frames = read_completed_frame_indices(OUTPUT_CSV)?;
+    let mut writer = open_frame_results_writer(OUTPUT_CSV, !completed_frames.is_empty())?;
+    if completed_frames.is_empty() {
+        write_frame_results_header(&mut writer)?;
+        writer.flush()?;
+    } else {
+        println!(
+            "found {} completed frames in {OUTPUT_CSV}; appending new results and skipping completed frames",
+            completed_frames.len()
+        );
+    }
+
+    let mut n_processed = 0usize;
+    let mut n_skipped = 0usize;
+    let mut n_already_completed = 0usize;
+    for i in 0..n_frames_to_process {
+        if completed_frames.contains(&i) {
+            n_already_completed += 1;
+            continue;
+        }
+
         // TODO: improve logging
         // println!("start frame {i}");
 
@@ -163,13 +197,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         // dataset reader returns one AoP value per pixel in sensor/image coordinates.
         let image_file = format!("camera_driver_gv_vis_image_raw_{:04}.png", i);
         let image_file = image_dir.join(image_file);
-        let aop = match fan_method::dataset::read_image(image_file) {
+        let aop = match fan_method::dataset::read_image(&image_file) {
             Ok(aop) => aop,
             Err(e) => {
-                eprintln!("failed to read image: {e}");
+                n_skipped += 1;
+                eprintln!("skipping frame {i}: failed to read image {image_file:?}: {e}");
                 continue;
             }
         };
+
+        if aop.len() != system.n_pixels {
+            n_skipped += 1;
+            eprintln!(
+                "skipping frame {i}: image contains {} AoP values but expected {}",
+                aop.len(),
+                system.n_pixels
+            );
+            continue;
+        }
 
         let frame = Frame {
             index: i,
@@ -180,7 +225,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             aop_s: aop,
         };
 
-        let result = process_frame(&frame, &system);
+        let result = match catch_unwind(AssertUnwindSafe(|| process_frame(&frame, &system))) {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                n_skipped += 1;
+                eprintln!("skipping frame {i}: {e}");
+                continue;
+            }
+            Err(_) => {
+                n_skipped += 1;
+                eprintln!("skipping frame {i}: processing panicked");
+                continue;
+            }
+        };
+
         println!(
             "frame {} timing: total={:.3} ms, psa={:.3} ms, pixel_loop={:.3} ms, eigendecomp={:.3} ms",
             result.index,
@@ -189,11 +247,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             result.pixel_loop_duration_ms,
             result.eigendecomp_duration_ms,
         );
-        results.push(result);
+        write_frame_result(&mut writer, &result)?;
+        writer.flush()?;
+        n_processed += 1;
     }
 
-    write_frame_results(OUTPUT_CSV, &results)?;
-    println!("wrote {} frame results to {OUTPUT_CSV}", results.len());
+    println!(
+        "finished: processed {n_processed} frames, skipped {n_skipped}, already completed {n_already_completed}; results written to {OUTPUT_CSV}"
+    );
 
     Ok(())
 }
@@ -269,6 +330,8 @@ struct PixelAccum {
     m_all: Matrix3<f64>,
     /// Normal-equation matrix accumulated only from Rayleigh-classified e-vectors.
     m_rayleigh: Matrix3<f64>,
+    /// Number of finite AoP pixels included in the all-pixel estimate.
+    n_valid_pixels: usize,
     /// Number of pixels classified as Rayleigh points.
     n_rayleigh_points: usize,
 }
@@ -278,6 +341,7 @@ impl PixelAccum {
         Self {
             m_all: Matrix3::zeros(),
             m_rayleigh: Matrix3::zeros(),
+            n_valid_pixels: 0,
             n_rayleigh_points: 0,
         }
     }
@@ -286,6 +350,7 @@ impl PixelAccum {
         Self {
             m_all: self.m_all + other.m_all,
             m_rayleigh: self.m_rayleigh + other.m_rayleigh,
+            n_valid_pixels: self.n_valid_pixels + other.n_valid_pixels,
             n_rayleigh_points: self.n_rayleigh_points + other.n_rayleigh_points,
         }
     }
@@ -298,7 +363,15 @@ impl PixelAccum {
 /// 2. Convert every measured pixel AoP into an e-vector in the camera frame.
 /// 3. Classify pixels whose measured AoP agrees with the PSA/Rayleigh prediction.
 /// 4. Estimate the solar direction from all e-vectors and from Rayleigh-filtered e-vectors.
-fn process_frame(frame: &Frame, system: &System) -> FrameResult {
+fn process_frame(frame: &Frame, system: &System) -> Result<FrameResult, String> {
+    if frame.aop_s.len() != system.n_pixels {
+        return Err(format!(
+            "frame has {} AoP values but system expects {} pixels",
+            frame.aop_s.len(),
+            system.n_pixels
+        ));
+    }
+
     let total_start = Instant::now();
 
     // PSA gives an independent reference sun vector in the local horizontal ENU
@@ -317,6 +390,11 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let pixel_accum = (0..system.n_pixels)
         .into_par_iter()
         .map(|i| {
+            let aop_s = frame.aop_s[i];
+            if !aop_s.is_finite() {
+                return PixelAccum::zero();
+            }
+
             let v_c = &system.all_v_c[i];
 
             // Predict the Rayleigh e-vector for this optical path using the PSA sun
@@ -333,7 +411,7 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
 
             // Convert the measured sensor AoP into the pixel's v-frame, convert the
             // predicted Rayleigh e-vector into its AoP, then compare the two axial angles.
-            let aop_v = aop_sensor_to_v(frame.aop_s[i], system.all_p_c[i]);
+            let aop_v = aop_sensor_to_v(aop_s, system.all_p_c[i]);
             let rayleigh_aop_v = aop_from_ev(&rayleigh_e_v);
             let is_rayleigh_point =
                 fan_method::aop_threshold(aop_v, rayleigh_aop_v, system.aop_threshold_rad);
@@ -344,8 +422,12 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
             let rot_c_v = rot_v_c.inverse();
             let e_v = ev_from_aop(aop_v);
             let e_c = rot_c_v * e_v;
+            if !(e_c.x.is_finite() && e_c.y.is_finite() && e_c.z.is_finite()) {
+                return PixelAccum::zero();
+            }
 
             let mut accum = PixelAccum::zero();
+            accum.n_valid_pixels = 1;
             accumulate_e_vector(&mut accum.m_all, &e_c);
             if is_rayleigh_point {
                 accumulate_e_vector(&mut accum.m_rayleigh, &e_c);
@@ -355,6 +437,10 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
         })
         .reduce(PixelAccum::zero, PixelAccum::combine);
     let pixel_loop_duration_ms = elapsed_ms(pixel_loop_start);
+
+    if pixel_accum.n_valid_pixels == 0 {
+        return Err("frame contains no finite AoP measurements".to_string());
+    }
 
     let eigendecomp_start = Instant::now();
 
@@ -388,7 +474,7 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
     let n_rayleigh_points = pixel_accum.n_rayleigh_points;
     let frac_rayleigh_points = n_rayleigh_points as f64 / system.n_pixels as f64;
 
-    FrameResult {
+    Ok(FrameResult {
         index: frame.index,
         time: frame.time,
         lat: frame.lat,
@@ -405,20 +491,58 @@ fn process_frame(frame: &Frame, system: &System) -> FrameResult {
         psa_duration_ms,
         pixel_loop_duration_ms,
         eigendecomp_duration_ms,
-    }
+    })
 }
 
-/// Write frame results to a CSV file, unpacking vector fields into x/y/z columns.
+/// Read frame indices already present in an existing result CSV.
 ///
-/// This produces one row per processed image frame. Vectors are flattened into scalar
-/// columns so the output can be consumed directly by pandas, spreadsheets, plotting
-/// tools, or HPC post-processing scripts.
-fn write_frame_results(
-    path: impl AsRef<Path>,
-    results: &[FrameResult],
-) -> Result<(), Box<dyn Error>> {
-    let mut writer = csv::Writer::from_path(path)?;
+/// This enables simple restart/resume behavior for HPC jobs: if the process is killed
+/// after writing some rows, a later run appends missing frames instead of recomputing
+/// frames that are already checkpointed in the CSV.
+fn read_completed_frame_indices(path: impl AsRef<Path>) -> Result<HashSet<usize>, Box<dyn Error>> {
+    let path = path.as_ref();
+    if !path.exists() || path.metadata()?.len() == 0 {
+        return Ok(HashSet::new());
+    }
 
+    let mut completed = HashSet::new();
+    let mut reader = csv::Reader::from_path(path)?;
+    for record in reader.records() {
+        let record = match record {
+            Ok(record) => record,
+            Err(e) => {
+                eprintln!("warning: ignoring malformed row in existing result CSV {path:?}: {e}");
+                continue;
+            }
+        };
+        if let Some(index) = record.get(0).and_then(|value| value.parse::<usize>().ok()) {
+            completed.insert(index);
+        }
+    }
+
+    Ok(completed)
+}
+
+/// Open the frame-result CSV either for append/resume or for a fresh run.
+fn open_frame_results_writer(
+    path: impl AsRef<Path>,
+    append_existing: bool,
+) -> Result<csv::Writer<File>, Box<dyn Error>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append_existing)
+        .truncate(!append_existing)
+        .open(path)?;
+
+    Ok(csv::Writer::from_writer(file))
+}
+
+/// Write the frame-result CSV header.
+///
+/// Vectors are flattened into scalar columns so the output can be consumed directly by
+/// pandas, spreadsheets, plotting tools, or HPC post-processing scripts.
+fn write_frame_results_header(writer: &mut csv::Writer<File>) -> Result<(), Box<dyn Error>> {
     writer.write_record([
         "index",
         "time",
@@ -443,34 +567,37 @@ fn write_frame_results(
         "pixel_loop_duration_ms",
         "eigendecomp_duration_ms",
     ])?;
+    Ok(())
+}
 
-    for result in results {
-        writer.write_record([
-            result.index.to_string(),
-            result.time.to_rfc3339(),
-            result.lat.to_string(),
-            result.lon.to_string(),
-            result.psa_s_c.x.to_string(),
-            result.psa_s_c.y.to_string(),
-            result.psa_s_c.z.to_string(),
-            result.s_c.x.to_string(),
-            result.s_c.y.to_string(),
-            result.s_c.z.to_string(),
-            result.rayleigh_s_c.x.to_string(),
-            result.rayleigh_s_c.y.to_string(),
-            result.rayleigh_s_c.z.to_string(),
-            result.psa_azimuth.to_string(),
-            result.azimuth.to_string(),
-            result.rayleigh_azimuth.to_string(),
-            result.n_rayleigh_points.to_string(),
-            result.frac_rayleigh_points.to_string(),
-            result.total_duration_ms.to_string(),
-            result.psa_duration_ms.to_string(),
-            result.pixel_loop_duration_ms.to_string(),
-            result.eigendecomp_duration_ms.to_string(),
-        ])?;
-    }
-
-    writer.flush()?;
+/// Append one processed frame to the result CSV.
+fn write_frame_result(
+    writer: &mut csv::Writer<File>,
+    result: &FrameResult,
+) -> Result<(), Box<dyn Error>> {
+    writer.write_record([
+        result.index.to_string(),
+        result.time.to_rfc3339(),
+        result.lat.to_string(),
+        result.lon.to_string(),
+        result.psa_s_c.x.to_string(),
+        result.psa_s_c.y.to_string(),
+        result.psa_s_c.z.to_string(),
+        result.s_c.x.to_string(),
+        result.s_c.y.to_string(),
+        result.s_c.z.to_string(),
+        result.rayleigh_s_c.x.to_string(),
+        result.rayleigh_s_c.y.to_string(),
+        result.rayleigh_s_c.z.to_string(),
+        result.psa_azimuth.to_string(),
+        result.azimuth.to_string(),
+        result.rayleigh_azimuth.to_string(),
+        result.n_rayleigh_points.to_string(),
+        result.frac_rayleigh_points.to_string(),
+        result.total_duration_ms.to_string(),
+        result.psa_duration_ms.to_string(),
+        result.pixel_loop_duration_ms.to_string(),
+        result.eigendecomp_duration_ms.to_string(),
+    ])?;
     Ok(())
 }
