@@ -44,7 +44,7 @@
 //!   - Unpack the vectors into NAME.x, NAME.y, NAME.z fields
 //! - [x] Add comments throughout that explain the implementation of the algorithm
 //! - [x] Optimize for HPC context -> parallelize?
-//! - [ ] Ensure no crashes during long running HPC job
+//! - [x] Ensure no crashes during long running HPC job
 //!   - Checkpointing
 //!   - Ensure all errors are handled: default to skip frame if problems arise
 //!   - Optimize "low hanging fruit" without spending too much time or too many changes on it
@@ -90,10 +90,41 @@ const IMAGE_DIR: &'static str =
 const OUTPUT_CSV: &'static str = "frame_results.csv";
 const N_FRAMES: usize = 10;
 
+macro_rules! log_info {
+    ($event:literal, $($arg:tt)*) => {
+        log_event("INFO", $event, format!($($arg)*))
+    };
+}
+
+macro_rules! log_warn {
+    ($event:literal, $($arg:tt)*) => {
+        log_event("WARN", $event, format!($($arg)*))
+    };
+}
+
+macro_rules! log_error {
+    ($event:literal, $($arg:tt)*) => {
+        log_event("ERROR", $event, format!($($arg)*))
+    };
+}
+
+fn log_event(level: &str, event: &str, message: String) {
+    println!(
+        "ts={} level={} event={} msg={:?}",
+        Utc::now().to_rfc3339(),
+        level,
+        event,
+        message
+    );
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("Fan Method v0.1");
-    println!("Implemented by Ben Potter in August 2026");
-    println!("See original paper: https://ieeexplore.ieee.org/document/11005588");
+    log_info!("startup", "Fan Method v0.1");
+    log_info!("startup", "Implemented by Ben Potter in August 2026");
+    log_info!(
+        "startup",
+        "See original paper: https://ieeexplore.ieee.org/document/11005588"
+    );
 
     // Fixed rotations determined by experimental setup.
     //
@@ -129,8 +160,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let optical_paths_duration = optical_paths_start.elapsed();
-    println!(
-        "precomputed optical paths in {:.3} ms",
+    log_info!(
+        "precompute_optical_paths",
+        "duration_ms={:.3}",
         optical_paths_duration.as_secs_f64() * 1_000.0
     );
 
@@ -147,8 +179,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let n_frames_to_process = N_FRAMES.min(n_available_frames);
 
     if N_FRAMES > n_available_frames {
-        eprintln!(
-            "requested {N_FRAMES} frames but only {n_available_frames} synchronized time/INS rows are available; processing {n_frames_to_process} frames"
+        log_warn!(
+            "frame_count_truncated",
+            "requested_frames={N_FRAMES} available_frames={n_available_frames} processing_frames={n_frames_to_process}"
         );
     }
 
@@ -161,8 +194,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         write_frame_results_header(&mut writer)?;
         writer.flush()?;
     } else {
-        println!(
-            "found {} completed frames in {OUTPUT_CSV}; appending new results and skipping completed frames",
+        log_info!(
+            "resume_output_csv",
+            "completed_frames={} output_csv={OUTPUT_CSV}",
             completed_frames.len()
         );
     }
@@ -176,8 +210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
 
-        // TODO: improve logging
-        // println!("start frame {i}");
+        log_info!("frame_start", "frame={i}");
 
         // Given by the ins_frame; lets us determine n-frame to c-frame.
         // Azimuth is taken CW from North (likely need to negate it).
@@ -201,15 +234,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(aop) => aop,
             Err(e) => {
                 n_skipped += 1;
-                eprintln!("skipping frame {i}: failed to read image {image_file:?}: {e}");
+                log_warn!(
+                    "skip_frame_image_read_failed",
+                    "frame={i} image_file={image_file:?} error={e}"
+                );
                 continue;
             }
         };
 
         if aop.len() != system.n_pixels {
             n_skipped += 1;
-            eprintln!(
-                "skipping frame {i}: image contains {} AoP values but expected {}",
+            log_warn!(
+                "skip_frame_bad_aop_len",
+                "frame={i} actual_aop_len={} expected_aop_len={}",
                 aop.len(),
                 system.n_pixels
             );
@@ -229,31 +266,35 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 n_skipped += 1;
-                eprintln!("skipping frame {i}: {e}");
+                log_warn!("skip_frame_processing_error", "frame={i} error={e}");
                 continue;
             }
             Err(_) => {
                 n_skipped += 1;
-                eprintln!("skipping frame {i}: processing panicked");
+                log_error!("skip_frame_processing_panic", "frame={i}");
                 continue;
             }
         };
 
-        println!(
-            "frame {} timing: total={:.3} ms, psa={:.3} ms, pixel_loop={:.3} ms, eigendecomp={:.3} ms",
+        log_info!(
+            "frame_processed",
+            "frame={} total_duration_ms={:.3} psa_duration_ms={:.3} pixel_loop_duration_ms={:.3} eigendecomp_duration_ms={:.3} n_rayleigh_points={} frac_rayleigh_points={:.6}",
             result.index,
             result.total_duration_ms,
             result.psa_duration_ms,
             result.pixel_loop_duration_ms,
             result.eigendecomp_duration_ms,
+            result.n_rayleigh_points,
+            result.frac_rayleigh_points,
         );
         write_frame_result(&mut writer, &result)?;
         writer.flush()?;
         n_processed += 1;
     }
 
-    println!(
-        "finished: processed {n_processed} frames, skipped {n_skipped}, already completed {n_already_completed}; results written to {OUTPUT_CSV}"
+    log_info!(
+        "finished",
+        "processed_frames={n_processed} skipped_frames={n_skipped} already_completed_frames={n_already_completed} output_csv={OUTPUT_CSV}"
     );
 
     Ok(())
@@ -454,8 +495,9 @@ fn process_frame(frame: &Frame, system: &System) -> Result<FrameResult, String> 
     // points. This filtered estimate should be less affected by clouds, reflections,
     // saturation, or other pixels whose AoP does not follow the Rayleigh model.
     let rayleigh_s_c = if pixel_accum.n_rayleigh_points == 0 {
-        eprintln!(
-            "frame {} had no rayleigh points; falling back to all e-vectors for rayleigh_s_c",
+        log_warn!(
+            "no_rayleigh_points",
+            "frame={} fallback=all_e_vectors_for_rayleigh_s_c",
             frame.index
         );
         s_c
@@ -511,7 +553,10 @@ fn read_completed_frame_indices(path: impl AsRef<Path>) -> Result<HashSet<usize>
         let record = match record {
             Ok(record) => record,
             Err(e) => {
-                eprintln!("warning: ignoring malformed row in existing result CSV {path:?}: {e}");
+                log_warn!(
+                    "malformed_existing_csv_row",
+                    "path={path:?} error={e} action=ignore_row"
+                );
                 continue;
             }
         };
